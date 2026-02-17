@@ -6,9 +6,9 @@
 # - Optional low-memory loading (forces string dtypes to avoid dtype blowups)
 # - Quick actions:
 #   * Remove self-referring links (Source == Destination) with light URL normalization
-#   * Exclude breadcrumb-like links using user-editable Link Path patterns (best practical approach)
-#   * Optional: Exclude query-string URLs (parameterised) and fragment-only URLs
-#   * Optional: Deduplicate Source→Destination pairs (keep first row)
+#   * Exclude breadcrumb-like links using user-editable Link Path patterns
+#   * Optional: Exclude query-string URLs (parameterised)
+#   * Optional: Deduplicate Source→Destination pairs (NOW applied AFTER ALL FILTERS)
 # - Dynamic include-filters for key columns (multiselect per column)
 # - Output: Top Destination URLs (Total Inlinks + Unique Source Pages)
 # - Download filtered CSV + download Top Destinations CSV
@@ -48,9 +48,7 @@ def load_csv(file, force_str: bool) -> pd.DataFrame:
     """
     read_kwargs = dict(low_memory=False)
     if force_str:
-        # dtype_backend can be 'pyarrow' on newer pandas, but not always available on Cloud.
         read_kwargs["dtype"] = "string"
-
     try:
         return pd.read_csv(file, **read_kwargs)
     except UnicodeDecodeError:
@@ -75,14 +73,11 @@ def normalize_url_for_compare(u: str) -> str:
     scheme = (parts.scheme or "").lower()
     netloc = (parts.netloc or "").lower()
     path = parts.path or ""
-
     # drop fragment
     fragment = ""
-
     # trim trailing slash (but keep "/" root)
     if path != "/" and path.endswith("/"):
         path = path.rstrip("/")
-
     return urlunsplit((scheme, netloc, path, parts.query, fragment))
 
 def compile_contains_patterns(lines: str) -> re.Pattern | None:
@@ -101,7 +96,6 @@ def compile_contains_patterns(lines: str) -> re.Pattern | None:
     return re.compile("|".join(pats), flags=re.IGNORECASE)
 
 def safe_str_series(s: pd.Series) -> pd.Series:
-    # ensures string operations don't error on missing values
     return s.astype("string").fillna("")
 
 # Columns we’ll offer filtering for if present
@@ -141,7 +135,7 @@ if missing_core:
 filtered_df = df.copy()
 
 # ---------------------------
-# Quick actions (best practical approach)
+# Quick actions
 # ---------------------------
 st.subheader("⚡ Quick actions")
 
@@ -155,9 +149,9 @@ with qa1:
     )
 with qa2:
     dedupe_pairs = st.checkbox(
-        "Deduplicate Source→Destination pairs",
+        "Deduplicate Source→Destination pairs (after all filters)",
         value=False,
-        help="Keeps only one row per (Source, Destination). Useful when the same link occurs multiple times on a page."
+        help="Applies deduplication after all filters (including column filters) have been applied."
     )
 with qa3:
     exclude_params = st.checkbox(
@@ -166,7 +160,7 @@ with qa3:
         help="Removes rows where Destination contains '?'. Helpful for faceted/sort/filter URLs."
     )
 
-# Breadcrumb/nav exclusion (best approach: Link Path pattern exclusion, user-editable)
+# Breadcrumb/nav exclusion (Link Path pattern exclusion, user-editable)
 st.subheader("🧭 Exclude breadcrumb / structural navigation via Link Path patterns")
 
 exclude_breadcrumbs = st.checkbox(
@@ -179,8 +173,8 @@ exclude_breadcrumbs = st.checkbox(
 )
 
 default_patterns = "\n".join([
-    "breadcrumb",            # class/id hints
-    "/ol/li",                # ordered list breadcrumbs
+    "breadcrumb",
+    "/ol/li",
     "aria-label=\"breadcrumb\"",
     "aria-label='breadcrumb'",
 ])
@@ -206,7 +200,7 @@ show_excluded_preview = st.checkbox(
 )
 
 # ---------------------------
-# Apply quick actions (in a sensible order)
+# Apply non-column filters
 # ---------------------------
 # 1) Remove self-referring links
 if remove_self:
@@ -216,14 +210,14 @@ if remove_self:
     filtered_df = filtered_df[src_norm != dst_norm].copy()
     st.info(f"Removed **{before - len(filtered_df):,}** self-referring rows.")
 
-# 2) Exclude query parameter destinations (optional)
+# 2) Exclude query parameter destinations
 if exclude_params:
     before = len(filtered_df)
     dst = safe_str_series(filtered_df["Destination"])
     filtered_df = filtered_df[~dst.str.contains(r"\?", regex=True)].copy()
     st.info(f"Removed **{before - len(filtered_df):,}** rows with query parameters in Destination.")
 
-# 3) Exclude breadcrumb-like links via Link Path (best practical approach)
+# 3) Exclude breadcrumb-like links via Link Path patterns
 if exclude_breadcrumbs:
     if "Link Path" not in filtered_df.columns:
         st.warning("No **Link Path** column found, so Link Path exclusions can’t be applied.")
@@ -247,12 +241,6 @@ if exclude_breadcrumbs:
             filtered_df = filtered_df[~mask].copy()
             st.info(f"Excluded **{excluded_count:,}** rows matching Link Path/Origin patterns.")
 
-# 4) Deduplicate Source→Destination pairs (optional)
-if dedupe_pairs:
-    before = len(filtered_df)
-    filtered_df = filtered_df.drop_duplicates(subset=["Source", "Destination"]).copy()
-    st.info(f"Removed **{before - len(filtered_df):,}** duplicate Source→Destination rows.")
-
 # ---------------------------
 # Column include-filters (dynamic)
 # ---------------------------
@@ -265,7 +253,6 @@ st.caption(
 
 for col in FILTER_COLUMNS:
     if col in filtered_df.columns:
-        # Unique values (sorted), keep blanks as "(blank)" so users can include/exclude them
         ser = filtered_df[col].astype("string")
         vals = ser.fillna("").unique().tolist()
 
@@ -275,26 +262,35 @@ for col in FILTER_COLUMNS:
             v = "" if v is None else str(v)
             display_vals.append("(blank)" if v.strip() == "" else v)
 
-        # map display -> real
-        pairs = sorted(set(zip(display_vals, ["" if dv == "(blank)" else dv for dv in display_vals])), key=lambda x: x[0].lower())
+        # map display -> real (note: values are strings because dtype='string')
+        pairs = sorted(
+            set((dv, "" if dv == "(blank)" else dv) for dv in display_vals),
+            key=lambda x: x[0].lower()
+        )
         options_display = [p[0] for p in pairs]
         display_to_real = {p[0]: p[1] for p in pairs}
-
-        default_display = options_display[:]  # include all by default
 
         selected_display = st.multiselect(
             f"Include values for **{col}**",
             options=options_display,
-            default=default_display
+            default=options_display
         )
 
         if len(selected_display) == 0:
             filtered_df = filtered_df.iloc[0:0].copy()
         else:
             selected_real = set(display_to_real[d] for d in selected_display)
-            filtered_df = filtered_df[filtered_df[col].astype("string").fillna("").isin(selected_real)].copy()
+            filtered_df = filtered_df[
+                filtered_df[col].astype("string").fillna("").isin(selected_real)
+            ].copy()
 
-st.success(f"✅ Filtered dataset: **{filtered_df.shape[0]:,} rows**")
+# ✅ Apply dedupe AFTER all filters (including column filters)
+if dedupe_pairs and not filtered_df.empty:
+    before = len(filtered_df)
+    filtered_df = filtered_df.drop_duplicates(subset=["Source", "Destination"]).copy()
+    st.info(f"Removed **{before - len(filtered_df):,}** duplicate Source→Destination rows (after all filters).")
+
+st.success(f"✅ Final dataset: **{filtered_df.shape[0]:,} rows**")
 
 # ---------------------------
 # Output: Most linked-to Destination URLs
@@ -304,7 +300,6 @@ st.subheader("🏆 Most linked-to Destination URLs")
 if filtered_df.empty:
     st.warning("No rows left after filtering.")
 else:
-    # Helpful option: count unique sources and total inlinks
     top_n = st.number_input("Rows to show", min_value=10, max_value=500, value=50, step=10)
 
     top_links = (
@@ -337,7 +332,7 @@ with c1:
     )
 
 with c2:
-    if not filtered_df.empty and "Destination" in filtered_df.columns:
+    if not filtered_df.empty:
         st.download_button(
             label="Download top destinations CSV",
             data=top_links.to_csv(index=False).encode("utf-8"),
@@ -354,19 +349,19 @@ with c2:
         )
 
 # ---------------------------
-# Tips (small, non-intrusive)
+# Tips
 # ---------------------------
 with st.expander("Notes / Tips"):
     st.markdown(
         """
-- **Breadcrumbs** often look like "Content" in Screaming Frog because they're inside `<main>` or content wrappers.
-  The most robust fix is **Link Path pattern exclusions** (what this tool implements).
-- For a clean internal link graph, typical filters are:
+- **Deduplication now happens after all filters**, including the column filters.  
+  This avoids cases where a Source→Destination pair exists in multiple contexts (e.g. Header + Content) and an early dedupe keeps the wrong one.
+- **Breadcrumbs** often look like "Content" because they're inside `<main>` or content wrappers. The best fix is **Link Path pattern exclusions**.
+- Typical “clean internal link graph” filters:
   - `Type = Hyperlink`
   - `Follow = Follow`
   - `Status Code = 200`
-  - `Link Position = Content` (optional, but often valuable)
-- If you want to remove faceted/sort URLs, enable **Exclude URLs with query parameters**.
+  - `Link Position = Content` (optional)
 """
     )
 
