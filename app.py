@@ -28,6 +28,21 @@ sample_rows = st.sidebar.number_input(
     step=5_000,
 )
 
+# Anchor counting can get memory-heavy on huge/dense sites.
+# This cap keeps memory bounded per destination while still finding top anchors in most cases.
+max_distinct_anchors_per_destination = st.sidebar.number_input(
+    "Max distinct anchors tracked per destination",
+    min_value=25,
+    max_value=2000,
+    value=200,
+    step=25,
+    help=(
+        "To keep memory stable, we cap how many distinct anchor texts we store per destination. "
+        "If a destination has more distinct anchors than this, extra anchors are counted in 'Other' "
+        "and may not be eligible to become the top anchor."
+    ),
+)
+
 def normalize_url_for_compare(u: str) -> str:
     if u is None or pd.isna(u):
         return ""
@@ -106,15 +121,15 @@ except Exception as e:
 sample_df = read_sample(path, int(sample_rows))
 
 required = {"Source", "Destination"}
-if not required.issubset(sample_df.columns):
-    st.error(f"Missing required columns: {', '.join(sorted(required - set(sample_df.columns)))}")
+missing = required - set(sample_df.columns)
+if missing:
+    st.error(f"Missing required columns: {', '.join(sorted(missing))}")
     st.stop()
 
 def uniq(col: str):
     if col not in sample_df.columns:
         return []
     vals = sample_df[col].astype("string").fillna("").unique().tolist()
-    # nice sort: blanks last
     vals = sorted(vals, key=lambda x: (x == "" or x is None, str(x).lower()))
     return vals
 
@@ -125,7 +140,6 @@ linkpos_options = uniq("Link Position")
 
 st.subheader("🎛️ Filters")
 
-# Quick preset button
 preset = st.button("✨ Preset: Content + Follow + 200 + Hyperlink")
 
 c1, c2, c3 = st.columns(3)
@@ -160,11 +174,26 @@ default_lp = "\n".join(["breadcrumb", "/ol/li", "aria-label=\"breadcrumb\"", "ar
 lp_text = st.text_area("Patterns to exclude (one per line)", value=default_lp, height=100, disabled=not exclude_by_link_path)
 rx_lp = compile_contains_patterns(lp_text) if exclude_by_link_path else None
 
+# Anchor column presence
+has_anchor_col = "Anchor" in sample_df.columns
+if not has_anchor_col:
+    st.warning("No 'Anchor' column found in the sample — Top Anchor columns will be blank unless the full file contains 'Anchor'.")
+
 run = st.button("🚀 Run analysis", type="primary")
 
 if run:
-    total_inlinks = {}      # Destination -> count
-    unique_sources = {}     # Destination -> set(Source)  (OK for many cases; if this becomes too big, we can swap later)
+    # Destination -> count of rows (after filters)
+    total_inlinks: dict[str, int] = {}
+    # Destination -> set(Source)
+    unique_sources: dict[str, set[str]] = {}
+
+    # Anchor aggregation:
+    # Destination -> total anchor occurrences (non-empty only)
+    anchor_total: dict[str, int] = {}
+    # Destination -> dict(anchor_text -> count) (capped)
+    anchor_counts: dict[str, dict[str, int]] = {}
+    # Destination -> count of anchor occurrences that were not stored due to cap
+    anchor_other: dict[str, int] = {}
 
     progress = st.progress(0, text="Reading file in chunks...")
 
@@ -191,10 +220,9 @@ if run:
         if "Source" not in chunk.columns or "Destination" not in chunk.columns:
             continue
 
+        # normalize required cols
         chunk["Source"] = chunk["Source"].astype("string").fillna("")
         chunk["Destination"] = chunk["Destination"].astype("string").fillna("")
-
-        before_chunk = len(chunk)
 
         # self-links
         if remove_self:
@@ -224,13 +252,51 @@ if run:
             lps = chunk["Link Path"].astype("string").fillna("")
             chunk = chunk[~lps.str.contains(rx_lp, na=False)]
 
+        if chunk.empty:
+            if chunks_seen % 5 == 0:
+                progress.progress(min(0.99, chunks_seen / (chunks_seen + 50)), text=f"Processed {rows_seen:,} rows...")
+            continue
+
+        # anchor series (optional)
+        anchor_series = None
+        if "Anchor" in chunk.columns:
+            anchor_series = chunk["Anchor"].astype("string").fillna("")
+
         # aggregate
-        if not chunk.empty:
-            for d, s in zip(chunk["Destination"].tolist(), chunk["Source"].tolist()):
-                if not d:
-                    continue
-                total_inlinks[d] = total_inlinks.get(d, 0) + 1
-                unique_sources.setdefault(d, set()).add(s)
+        dests = chunk["Destination"].tolist()
+        srcs = chunk["Source"].tolist()
+        anchors = anchor_series.tolist() if anchor_series is not None else ["" for _ in dests]
+
+        for d, s, a in zip(dests, srcs, anchors):
+            if not d:
+                continue
+
+            # Total rows
+            total_inlinks[d] = total_inlinks.get(d, 0) + 1
+
+            # Unique sources
+            unique_sources.setdefault(d, set()).add(s)
+
+            # Anchor stats (non-empty only)
+            a = str(a).strip()
+            if a:
+                anchor_total[d] = anchor_total.get(d, 0) + 1
+
+                dest_map = anchor_counts.get(d)
+                if dest_map is None:
+                    dest_map = {}
+                    anchor_counts[d] = dest_map
+
+                # if anchor already tracked, increment
+                if a in dest_map:
+                    dest_map[a] += 1
+                else:
+                    # if we haven't hit cap, start tracking
+                    if len(dest_map) < int(max_distinct_anchors_per_destination):
+                        dest_map[a] = 1
+                    else:
+                        # otherwise count it as "other"
+                        anchor_other[d] = anchor_other.get(d, 0) + 1
 
         # progress
         if chunks_seen % 5 == 0:
@@ -240,22 +306,56 @@ if run:
 
     if not total_inlinks:
         st.warning(
-            "No rows matched your filters. Most likely cause: your include-only selections don’t match the file values.\n\n"
-            "Try clearing the include-only filters (set them to empty) and run again."
+            "No rows matched your filters.\n\n"
+            "Most likely cause: your include-only selections are too strict. "
+            "Try clearing one or more include-only filters (set them to empty) and run again."
         )
         st.stop()
 
+    # Build output rows
+    destinations = list(total_inlinks.keys())
+
+    top_anchor = []
+    top_anchor_pct = []
+
+    for d in destinations:
+        total_anchor_occ = anchor_total.get(d, 0)
+
+        if total_anchor_occ == 0:
+            top_anchor.append("")
+            top_anchor_pct.append(0.0)
+            continue
+
+        amap = anchor_counts.get(d, {})
+        if not amap:
+            # anchors existed but weren't tracked (unlikely unless cap=0, which we disallow)
+            top_anchor.append("")
+            top_anchor_pct.append(0.0)
+            continue
+
+        # find top tracked anchor
+        best_a, best_c = max(amap.items(), key=lambda kv: kv[1])
+
+        # % of all anchor occurrences (non-empty) for that destination
+        pct = (best_c / total_anchor_occ) * 100.0
+
+        top_anchor.append(best_a)
+        top_anchor_pct.append(round(pct, 2))
+
     out = pd.DataFrame({
-        "Destination": list(total_inlinks.keys()),
-        "Total_Inlinks": [total_inlinks[d] for d in total_inlinks.keys()],
-        "Unique_Source_Pages": [len(unique_sources.get(d, set())) for d in total_inlinks.keys()],
+        "Destination": destinations,
+        "Total_Inlinks": [total_inlinks[d] for d in destinations],
+        "Unique_Source_Pages": [len(unique_sources.get(d, set())) for d in destinations],
+        "Top Anchor": top_anchor,
+        "Top Anchor %": top_anchor_pct,
     }).sort_values(["Total_Inlinks", "Unique_Source_Pages"], ascending=False)
 
+    st.subheader("🏆 Top Destination URLs")
     top_n = st.number_input("Rows to show", min_value=10, max_value=500, value=50, step=10)
     out_top = out.head(int(top_n))
-
-    st.subheader("🏆 Top Destination URLs")
     st.dataframe(out_top, use_container_width=True)
+
+    st.subheader("⬇️ Downloads")
 
     st.download_button(
         "Download top destinations CSV",
@@ -263,6 +363,31 @@ if run:
         file_name="top_destinations.csv",
         mime="text/csv",
     )
+
+    # ✅ NEW: download all destinations
+    st.download_button(
+        "Download ALL destinations CSV",
+        data=out.to_csv(index=False).encode("utf-8"),
+        file_name="all_destinations_summary.csv",
+        mime="text/csv",
+    )
+
+    # Optional info about anchor cap
+    with st.expander("About Top Anchor %"):
+        st.markdown(
+            """
+- **Top Anchor** is the most common anchor text (by occurrences) for each Destination URL.
+- **Top Anchor %** is:
+
+  `top_anchor_occurrences ÷ total_anchor_occurrences_for_that_destination × 100`
+
+- Blank anchors are ignored for anchor calculations.
+- To keep memory stable, the app caps how many distinct anchors it tracks per destination
+  (you can change this in the sidebar). If a destination has extremely high anchor diversity,
+  the true top anchor *could* be outside the tracked set — but in practice, the top anchor is
+  usually among the most frequent and will be captured.
+"""
+        )
 
 
 
