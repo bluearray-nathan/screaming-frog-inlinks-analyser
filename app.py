@@ -67,6 +67,27 @@ class Aggregates:
     filtered_rows_written: int
 
 
+@dataclass
+class FilterStats:
+    # row counts
+    total_rows_read: int
+    total_rows_kept: int
+
+    # removed by each step (row-level)
+    removed_self: int
+    removed_params: int
+    removed_type: int
+    removed_follow: int
+    removed_status: int
+    removed_link_position: int
+    removed_link_path: int
+    removed_anchor: int
+
+    # destination-level removal (computed after table)
+    destinations_before: int
+    destinations_removed_by_dominance: int
+
+
 # =========================
 # Helpers: normalization & patterns
 # =========================
@@ -176,10 +197,12 @@ def chunk_iterator(path: str, chunksize: int):
 
 
 # =========================
-# Filtering: apply row-level filters to a chunk
+# Filtering: apply row-level filters to a chunk WITH per-step stats
 # =========================
-def apply_row_filters(chunk: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame:
-    """Apply chunk-safe row-level filters. Return filtered chunk (may be empty)."""
+def apply_row_filters_with_stats(chunk: pd.DataFrame, cfg: AppConfig, stats: FilterStats) -> pd.DataFrame:
+    """
+    Apply chunk-safe row-level filters step-by-step and track rows removed at each stage.
+    """
     if "Source" not in chunk.columns or "Destination" not in chunk.columns:
         return chunk.iloc[0:0].copy()
 
@@ -187,38 +210,54 @@ def apply_row_filters(chunk: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame:
     chunk["Source"] = chunk["Source"].astype("string").fillna("")
     chunk["Destination"] = chunk["Destination"].astype("string").fillna("")
 
-    # Remove self links
+    # (1) Remove self links
     if cfg.remove_self:
+        before = len(chunk)
         src_norm = chunk["Source"].map(normalize_url_for_compare)
         dst_norm = chunk["Destination"].map(normalize_url_for_compare)
         chunk = chunk[src_norm != dst_norm]
+        stats.removed_self += (before - len(chunk))
 
-    # Exclude ? params in destination
+    # (2) Exclude ? params in destination
     if cfg.exclude_params:
+        before = len(chunk)
         chunk = chunk[~chunk["Destination"].str.contains(r"\?", regex=True, na=False)]
+        stats.removed_params += (before - len(chunk))
 
-    # Include-only filters (apply only when selection non-empty and col exists)
+    # (3) Include-only filters (only apply if selection non-empty and col exists)
     if cfg.type_keep and "Type" in chunk.columns:
+        before = len(chunk)
         chunk = chunk[chunk["Type"].astype("string").fillna("").isin(cfg.type_keep)]
+        stats.removed_type += (before - len(chunk))
 
     if cfg.follow_keep and "Follow" in chunk.columns:
+        before = len(chunk)
         chunk = chunk[chunk["Follow"].astype("string").fillna("").isin(cfg.follow_keep)]
+        stats.removed_follow += (before - len(chunk))
 
     if cfg.status_keep and "Status Code" in chunk.columns:
+        before = len(chunk)
         chunk = chunk[chunk["Status Code"].astype("string").fillna("").isin(cfg.status_keep)]
+        stats.removed_status += (before - len(chunk))
 
     if cfg.link_position_keep and "Link Position" in chunk.columns:
+        before = len(chunk)
         chunk = chunk[chunk["Link Position"].astype("string").fillna("").isin(cfg.link_position_keep)]
+        stats.removed_link_position += (before - len(chunk))
 
-    # Link Path exclusions
+    # (4) Link Path exclusions
     if cfg.rx_link_path_excl is not None and "Link Path" in chunk.columns:
+        before = len(chunk)
         lp = chunk["Link Path"].astype("string").fillna("")
         chunk = chunk[~lp.str.contains(cfg.rx_link_path_excl, na=False)]
+        stats.removed_link_path += (before - len(chunk))
 
-    # Anchor exclusions (row-level)
+    # (5) Anchor exclusions (row-level)
     if cfg.rx_anchor_excl is not None and "Anchor" in chunk.columns:
+        before = len(chunk)
         anc = chunk["Anchor"].astype("string").fillna("")
         chunk = chunk[~anc.str.contains(cfg.rx_anchor_excl, na=False)]
+        stats.removed_anchor += (before - len(chunk))
 
     return chunk
 
@@ -227,7 +266,6 @@ def apply_row_filters(chunk: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame:
 # Aggregation: update stats
 # =========================
 def update_aggregates_from_chunk(chunk: pd.DataFrame, cfg: AppConfig, agg: Aggregates) -> None:
-    """Update destination counts, unique sources, and anchor stats from a filtered chunk."""
     dests = chunk["Destination"].astype("string").fillna("").tolist()
     srcs = chunk["Source"].astype("string").fillna("").tolist()
 
@@ -261,7 +299,6 @@ def update_aggregates_from_chunk(chunk: pd.DataFrame, cfg: AppConfig, agg: Aggre
         else:
             if len(dest_map) < int(cfg.max_distinct_anchors_per_destination):
                 dest_map[a] = 1
-            # else: silently drop additional distinct anchors to keep memory bounded
 
 
 # =========================
@@ -292,32 +329,30 @@ def compute_top_anchor_fields(destinations: List[str], agg: Aggregates) -> Tuple
     return top_anchor, top_anchor_pct
 
 
-def apply_destination_level_filters(out: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame:
+def apply_destination_level_filters(out: pd.DataFrame, cfg: AppConfig, stats: FilterStats) -> pd.DataFrame:
+    stats.destinations_before = len(out)
+
     if not cfg.enable_anchor_dominance_filter:
+        stats.destinations_removed_by_dominance = 0
         return out
 
-    before = len(out)
     thr = float(cfg.dominance_threshold)
 
     if cfg.only_apply_dominance_when_top_anchor_is_cta:
         norm_top = out["Top Anchor"].map(norm_anchor_text)
         is_cta = norm_top.isin(cfg.cta_phrases_norm)
-        out = out[~(is_cta & (out["Top Anchor %"] >= thr))]
+        filtered = out[~(is_cta & (out["Top Anchor %"] >= thr))]
     else:
-        out = out[out["Top Anchor %"] < thr]
+        filtered = out[out["Top Anchor %"] < thr]
 
-    st.info(f"Top Anchor % filter removed **{before - len(out):,}** destinations.")
-    return out
+    stats.destinations_removed_by_dominance = len(out) - len(filtered)
+    return filtered
 
 
 # =========================
 # Optional: stream-write filtered CSV
 # =========================
 def maybe_write_filtered_chunk(chunk: pd.DataFrame, cfg: AppConfig, agg: Aggregates, wrote_header: bool) -> bool:
-    """
-    Append a chunk to filtered CSV output if enabled.
-    Returns updated wrote_header flag.
-    """
     if not cfg.write_filtered_csv or agg.filtered_out_path is None:
         return wrote_header
 
@@ -465,8 +500,6 @@ except Exception as e:
     st.error(f"Failed to read file: {e}")
     st.stop()
 
-# Read sample (for validation + dropdown options)
-# Note: sample_rows itself comes from sidebar; we default to 50k in build_config
 sample_df_initial = read_sample(path, 50_000)
 
 required_cols = {"Source", "Destination"}
@@ -476,10 +509,6 @@ if missing:
     st.stop()
 
 cfg = build_config(sample_df_initial)
-
-# If user changed sample_rows, re-read sample for options? (Optional)
-# We keep it simple: sample_df_initial is enough to populate filter values.
-
 run = st.button("🚀 Run analysis", type="primary")
 
 if run:
@@ -499,37 +528,48 @@ if run:
         filtered_rows_written=0,
     )
 
+    stats = FilterStats(
+        total_rows_read=0,
+        total_rows_kept=0,
+        removed_self=0,
+        removed_params=0,
+        removed_type=0,
+        removed_follow=0,
+        removed_status=0,
+        removed_link_position=0,
+        removed_link_path=0,
+        removed_anchor=0,
+        destinations_before=0,
+        destinations_removed_by_dominance=0,
+    )
+
     progress = st.progress(0, text="Reading file in chunks...")
 
     wrote_header = False
-    rows_seen = 0
     chunks_seen = 0
 
     for chunk in chunk_iterator(path, cfg.chunksize):
         chunks_seen += 1
-        rows_seen += len(chunk)
+        stats.total_rows_read += len(chunk)
 
-        filtered = apply_row_filters(chunk, cfg)
+        filtered = apply_row_filters_with_stats(chunk, cfg, stats)
+        stats.total_rows_kept += len(filtered)
+
         if filtered.empty:
             if chunks_seen % 5 == 0:
-                progress.progress(min(0.99, chunks_seen / (chunks_seen + 50)), text=f"Processed {rows_seen:,} rows...")
+                progress.progress(min(0.99, chunks_seen / (chunks_seen + 50)), text=f"Processed {stats.total_rows_read:,} rows...")
             continue
 
-        # optional: write filtered rows to CSV incrementally
         wrote_header = maybe_write_filtered_chunk(filtered, cfg, agg, wrote_header)
-
-        # update aggregates
         update_aggregates_from_chunk(filtered, cfg, agg)
 
         if chunks_seen % 5 == 0:
-            progress.progress(min(0.99, chunks_seen / (chunks_seen + 50)), text=f"Processed {rows_seen:,} rows...")
+            progress.progress(min(0.99, chunks_seen / (chunks_seen + 50)), text=f"Processed {stats.total_rows_read:,} rows...")
 
-    progress.progress(1.0, text=f"Done. Processed {rows_seen:,} rows.")
+    progress.progress(1.0, text=f"Done. Processed {stats.total_rows_read:,} rows.")
 
-    if not agg.total_inlinks:
-        st.warning(
-            "No rows matched your filters. Try clearing one or more include-only filters or disabling Anchor exclusions."
-        )
+    if stats.total_rows_kept == 0:
+        st.warning("No rows matched your filters. Try clearing include-only filters or disabling Anchor exclusions.")
         st.stop()
 
     # Build output table
@@ -544,17 +584,73 @@ if run:
         "Top Anchor %": top_anchor_pct,
     })
 
-    # Destination-level filters (dominance)
-    out = apply_destination_level_filters(out, cfg)
+    # Destination-level filters
+    out = apply_destination_level_filters(out, cfg, stats)
 
     # Sort
     out = out.sort_values(["Total_Inlinks", "Unique_Source_Pages"], ascending=False).reset_index(drop=True)
 
+    # =========================
+    # Filter Impact Summary
+    # =========================
+    st.subheader("📊 Filter impact summary")
+
+    total_removed = (
+        stats.removed_self
+        + stats.removed_params
+        + stats.removed_type
+        + stats.removed_follow
+        + stats.removed_status
+        + stats.removed_link_position
+        + stats.removed_link_path
+        + stats.removed_anchor
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Rows read", f"{stats.total_rows_read:,}")
+    with c2:
+        st.metric("Rows kept", f"{stats.total_rows_kept:,}")
+    with c3:
+        st.metric("Rows removed (tracked)", f"{total_removed:,}")
+    with c4:
+        # sanity: some rows might be removed by multiple filters sequentially; tracked removals sum should equal read-kept
+        st.metric("Read - kept", f"{(stats.total_rows_read - stats.total_rows_kept):,}")
+
+    st.caption(
+        "Removals below are counted sequentially per chunk (each filter sees the remaining rows). "
+        "These should sum to Read - Kept."
+    )
+
+    breakdown = pd.DataFrame([
+        {"Filter": "Remove self-referring", "Rows removed": stats.removed_self},
+        {"Filter": "Exclude query params", "Rows removed": stats.removed_params},
+        {"Filter": "Type include-only", "Rows removed": stats.removed_type},
+        {"Filter": "Follow include-only", "Rows removed": stats.removed_follow},
+        {"Filter": "Status Code include-only", "Rows removed": stats.removed_status},
+        {"Filter": "Link Position include-only", "Rows removed": stats.removed_link_position},
+        {"Filter": "Link Path exclusions", "Rows removed": stats.removed_link_path},
+        {"Filter": "Anchor exclusions", "Rows removed": stats.removed_anchor},
+    ])
+
+    st.dataframe(breakdown, use_container_width=True)
+
+    st.caption(
+        f"Destinations before destination-level filter: {stats.destinations_before:,} • "
+        f"Removed by Top Anchor % filter: {stats.destinations_removed_by_dominance:,}"
+    )
+
+    # =========================
+    # Results table
+    # =========================
     st.subheader("🏆 Top Destination URLs")
     top_n = st.number_input("Rows to show", min_value=10, max_value=500, value=50, step=10)
     out_top = out.head(int(top_n))
     st.dataframe(out_top, use_container_width=True)
 
+    # =========================
+    # Downloads
+    # =========================
     st.subheader("⬇️ Downloads")
 
     st.download_button(
