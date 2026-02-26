@@ -1,7 +1,6 @@
 import re
 import zipfile
 import tempfile
-import os
 from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
@@ -29,15 +28,16 @@ sample_rows = st.sidebar.number_input(
     step=5_000,
 )
 
-# Anchor counting can get memory-heavy on huge/dense sites.
+# Anchor counting can get memory-heavy on huge/dense sites
 max_distinct_anchors_per_destination = st.sidebar.number_input(
     "Max distinct anchors tracked per destination",
     min_value=25,
     max_value=2000,
-    value=200,
+    value=300,
     step=25,
     help=(
-        "Caps how many distinct anchor texts are stored per destination to keep memory stable."
+        "Caps how many distinct anchor texts are stored per destination to keep memory stable. "
+        "Higher = more accurate top-anchor detection, more memory."
     ),
 )
 
@@ -51,16 +51,18 @@ write_filtered_csv = st.sidebar.checkbox(
     ),
 )
 
-# Optional: limit output size for Cloud safety
 max_filtered_rows = st.sidebar.number_input(
     "Max filtered rows to write (0 = no limit)",
     min_value=0,
     max_value=50_000_000,
     value=0,
     step=100_000,
-    help="Set a cap to prevent generating a massive output file."
+    help="Set a cap to prevent generating a massive output file.",
 )
 
+# -------------------------
+# Helpers
+# -------------------------
 def normalize_url_for_compare(u: str) -> str:
     if u is None or pd.isna(u):
         return ""
@@ -76,6 +78,10 @@ def normalize_url_for_compare(u: str) -> str:
     return urlunsplit((scheme, netloc, path, parts.query, ""))  # drop fragment
 
 def compile_contains_patterns(lines: str) -> re.Pattern | None:
+    """
+    Each non-empty line is treated as a 'contains' token.
+    We escape tokens and OR them into a single case-insensitive regex.
+    """
     pats = []
     for line in (lines or "").splitlines():
         line = line.strip()
@@ -120,6 +126,22 @@ def read_sample(path: str, nrows: int) -> pd.DataFrame:
         kwargs["encoding"] = "cp1252"
         return pd.read_csv(path, **kwargs)
 
+def uniq(df: pd.DataFrame, col: str):
+    if col not in df.columns:
+        return []
+    vals = df[col].astype("string").fillna("").unique().tolist()
+    return sorted(vals, key=lambda x: (x == "" or x is None, str(x).lower()))
+
+def norm_anchor(a: str) -> str:
+    # normalize whitespace + lowercase for comparisons
+    a = "" if a is None else str(a)
+    a = a.strip()
+    a = re.sub(r"\s+", " ", a)
+    return a.lower()
+
+# -------------------------
+# Load input
+# -------------------------
 if uploaded_file is None:
     st.info("Upload a file to begin.")
     st.stop()
@@ -138,19 +160,17 @@ if missing:
     st.error(f"Missing required columns: {', '.join(sorted(missing))}")
     st.stop()
 
-def uniq(col: str):
-    if col not in sample_df.columns:
-        return []
-    vals = sample_df[col].astype("string").fillna("").unique().tolist()
-    vals = sorted(vals, key=lambda x: (x == "" or x is None, str(x).lower()))
-    return vals
+# Detect real filter values from sample
+type_options = uniq(sample_df, "Type")
+follow_options = uniq(sample_df, "Follow")
+status_options = uniq(sample_df, "Status Code")
+linkpos_options = uniq(sample_df, "Link Position")
 
-type_options = uniq("Type")
-follow_options = uniq("Follow")
-status_options = uniq("Status Code")
-linkpos_options = uniq("Link Position")
-
+# -------------------------
+# Filters UI
+# -------------------------
 st.subheader("🎛️ Filters")
+
 preset = st.button("✨ Preset: Content + Follow + 200 + Hyperlink")
 
 c1, c2, c3 = st.columns(3)
@@ -180,20 +200,74 @@ else:
 st.markdown("### Exclude by Link Path patterns (breadcrumbs/nav etc.)")
 exclude_by_link_path = st.checkbox("Enable Link Path exclusions", value=True)
 default_lp = "\n".join(["breadcrumb", "/ol/li", "aria-label=\"breadcrumb\"", "aria-label='breadcrumb'"])
-lp_text = st.text_area("Patterns to exclude (one per line)", value=default_lp, height=100, disabled=not exclude_by_link_path)
+lp_text = st.text_area("Link Path patterns to exclude (one per line)", value=default_lp, height=100, disabled=not exclude_by_link_path)
 rx_lp = compile_contains_patterns(lp_text) if exclude_by_link_path else None
 
+st.markdown("### 🚫 Exclude by Anchor text (template CTAs etc.)")
+enable_anchor_exclusions = st.checkbox(
+    "Enable Anchor exclusions",
+    value=True,
+    help="Excludes rows where Anchor contains any of the phrases below (case-insensitive)."
+)
+
+default_anchor_excl = "\n".join([
+    "discover more",
+    "read more",
+    "learn more",
+    "find out more",
+    "view more",
+    "see more",
+])
+anchor_excl_text = st.text_area(
+    "Anchor phrases to exclude (one per line, 'contains' match)",
+    value=default_anchor_excl,
+    height=120,
+    disabled=not enable_anchor_exclusions
+)
+rx_anchor_excl = compile_contains_patterns(anchor_excl_text) if enable_anchor_exclusions else None
+
+st.markdown("### 🧠 Optional: template CTA dominance filter (Top Anchor %)")
+enable_anchor_dominance_filter = st.checkbox(
+    "Enable Top Anchor % filter",
+    value=False,
+    help=(
+        "After analysis, exclude destinations whose Top Anchor accounts for >= threshold% "
+        "of all anchor occurrences to that destination."
+    ),
+)
+
+dominance_threshold = st.slider(
+    "Exclude destinations with Top Anchor % ≥",
+    min_value=0,
+    max_value=100,
+    value=70,
+    step=1,
+    disabled=not enable_anchor_dominance_filter,
+)
+
+only_apply_dominance_when_top_anchor_is_cta = st.checkbox(
+    "Only apply Top Anchor % filter when Top Anchor matches CTA list above",
+    value=True,
+    disabled=not enable_anchor_dominance_filter,
+    help="Recommended: avoids excluding genuinely popular pages with diverse contextual anchors.",
+)
+
+# -------------------------
+# Run analysis
+# -------------------------
 run = st.button("🚀 Run analysis", type="primary")
 
 if run:
+    # Core aggregates
     total_inlinks: dict[str, int] = {}
     unique_sources: dict[str, set[str]] = {}
 
-    anchor_total: dict[str, int] = {}
-    anchor_counts: dict[str, dict[str, int]] = {}
-    anchor_other: dict[str, int] = {}
+    # Anchor aggregates (for Top Anchor + %)
+    anchor_total: dict[str, int] = {}                 # dest -> total non-empty anchor occurrences
+    anchor_counts: dict[str, dict[str, int]] = {}     # dest -> {anchor_text -> count} (capped)
+    anchor_other: dict[str, int] = {}                 # dest -> count of anchors not stored due to cap
 
-    # Prepare filtered CSV output file (stream-write)
+    # Optional filtered CSV output
     filtered_out_path = None
     wrote_header = False
     filtered_rows_written = 0
@@ -202,6 +276,13 @@ if run:
         tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
         filtered_out_path = tmpf.name
         tmpf.close()
+
+    # Prepare anchor exclusion normalized CTA set (for dominance "only when CTA")
+    cta_set = set()
+    for line in (anchor_excl_text or "").splitlines():
+        line = norm_anchor(line)
+        if line:
+            cta_set.add(line)
 
     progress = st.progress(0, text="Reading file in chunks...")
 
@@ -228,18 +309,21 @@ if run:
         if "Source" not in chunk.columns or "Destination" not in chunk.columns:
             continue
 
+        # normalize required cols
         chunk["Source"] = chunk["Source"].astype("string").fillna("")
         chunk["Destination"] = chunk["Destination"].astype("string").fillna("")
 
-        # filters
+        # self-links
         if remove_self:
             src_norm = chunk["Source"].map(normalize_url_for_compare)
             dst_norm = chunk["Destination"].map(normalize_url_for_compare)
             chunk = chunk[src_norm != dst_norm]
 
+        # params
         if exclude_params:
             chunk = chunk[~chunk["Destination"].str.contains(r"\?", regex=True, na=False)]
 
+        # include-only filters (only apply if selection is non-empty and column exists)
         if type_keep and "Type" in chunk.columns:
             chunk = chunk[chunk["Type"].astype("string").fillna("").isin(type_keep)]
 
@@ -252,9 +336,16 @@ if run:
         if link_position_keep and "Link Position" in chunk.columns:
             chunk = chunk[chunk["Link Position"].astype("string").fillna("").isin(link_position_keep)]
 
+        # Link Path exclusions
         if rx_lp is not None and "Link Path" in chunk.columns:
             lps = chunk["Link Path"].astype("string").fillna("")
             chunk = chunk[~lps.str.contains(rx_lp, na=False)]
+
+        # Anchor exclusions (row-level)
+        if rx_anchor_excl is not None and "Anchor" in chunk.columns:
+            anc = chunk["Anchor"].astype("string").fillna("")
+            # exclude rows whose Anchor contains excluded phrase(s)
+            chunk = chunk[~anc.str.contains(rx_anchor_excl, na=False)]
 
         if chunk.empty:
             if chunks_seen % 5 == 0:
@@ -277,7 +368,7 @@ if run:
                 wrote_header = True
                 filtered_rows_written += len(chunk_to_write)
 
-        # Anchor series
+        # Anchor series for stats (after row-level anchor exclusions)
         anchor_series = chunk["Anchor"].astype("string").fillna("") if "Anchor" in chunk.columns else None
 
         dests = chunk["Destination"].tolist()
@@ -291,8 +382,8 @@ if run:
             total_inlinks[d] = total_inlinks.get(d, 0) + 1
             unique_sources.setdefault(d, set()).add(s)
 
-            a = str(a).strip()
-            if a:
+            a_str = str(a).strip()
+            if a_str:
                 anchor_total[d] = anchor_total.get(d, 0) + 1
 
                 dest_map = anchor_counts.get(d)
@@ -300,11 +391,11 @@ if run:
                     dest_map = {}
                     anchor_counts[d] = dest_map
 
-                if a in dest_map:
-                    dest_map[a] += 1
+                if a_str in dest_map:
+                    dest_map[a_str] += 1
                 else:
                     if len(dest_map) < int(max_distinct_anchors_per_destination):
-                        dest_map[a] = 1
+                        dest_map[a_str] = 1
                     else:
                         anchor_other[d] = anchor_other.get(d, 0) + 1
 
@@ -316,10 +407,11 @@ if run:
     if not total_inlinks:
         st.warning(
             "No rows matched your filters.\n\n"
-            "Try clearing one or more include-only filters (set them to empty) and run again."
+            "Try clearing one or more include-only filters, or disabling Anchor exclusions, then run again."
         )
         st.stop()
 
+    # Build base output with top anchor + %
     destinations = list(total_inlinks.keys())
     top_anchor = []
     top_anchor_pct = []
@@ -339,7 +431,6 @@ if run:
 
         best_a, best_c = max(amap.items(), key=lambda kv: kv[1])
         pct = (best_c / total_anchor_occ) * 100.0
-
         top_anchor.append(best_a)
         top_anchor_pct.append(round(pct, 2))
 
@@ -349,7 +440,23 @@ if run:
         "Unique_Source_Pages": [len(unique_sources.get(d, set())) for d in destinations],
         "Top Anchor": top_anchor,
         "Top Anchor %": top_anchor_pct,
-    }).sort_values(["Total_Inlinks", "Unique_Source_Pages"], ascending=False)
+    })
+
+    # Apply optional dominance filter (destination-level, after stats computed)
+    if enable_anchor_dominance_filter:
+        before = len(out)
+        if only_apply_dominance_when_top_anchor_is_cta:
+            # apply only where top anchor (normalized) matches one of the CTA phrases
+            norm_top = out["Top Anchor"].map(norm_anchor)
+            is_cta = norm_top.isin(cta_set)
+            out = out[~(is_cta & (out["Top Anchor %"] >= float(dominance_threshold)))]
+        else:
+            out = out[out["Top Anchor %"] < float(dominance_threshold)]
+
+        st.info(f"Top Anchor % filter removed **{before - len(out):,}** destinations.")
+
+    # Sort output
+    out = out.sort_values(["Total_Inlinks", "Unique_Source_Pages"], ascending=False).reset_index(drop=True)
 
     st.subheader("🏆 Top Destination URLs")
     top_n = st.number_input("Rows to show", min_value=10, max_value=500, value=50, step=10)
@@ -357,7 +464,6 @@ if run:
     st.dataframe(out_top, use_container_width=True)
 
     st.subheader("⬇️ Downloads")
-
     st.download_button(
         "Download top destinations CSV",
         data=out_top.to_csv(index=False).encode("utf-8"),
@@ -373,8 +479,6 @@ if run:
     )
 
     if filtered_out_path is not None:
-        # Read bytes for download (note: could be large; still usually OK for moderate outputs)
-        # If outputs are huge, you may want to warn users or cap max_filtered_rows.
         with open(filtered_out_path, "rb") as f:
             st.download_button(
                 "Download FILTERED links CSV (all columns, filtered rows)",
@@ -382,11 +486,23 @@ if run:
                 file_name="filtered_all_inlinks.csv",
                 mime="text/csv",
             )
-
         if max_filtered_rows and filtered_rows_written >= int(max_filtered_rows):
-            st.info(f"Filtered CSV was capped at **{filtered_rows_written:,} rows** (per the max rows setting).")
+            st.info(f"Filtered CSV was capped at **{filtered_rows_written:,} rows** (max rows setting).")
 
-    # Best-effort cleanup of temp filtered file on rerun: left as-is to avoid Streamlit rerun issues.
+    with st.expander("How the CTA/template filters work"):
+        st.markdown(
+            """
+**Anchor exclusions (row-level)**  
+Removes individual links where the **Anchor** contains any excluded phrase (case-insensitive).  
+This is great for template card CTAs like “Read more” / “Discover more”.
+
+**Top Anchor % filter (destination-level)**  
+After computing top anchors for each destination, you can remove destinations where one anchor dominates  
+(e.g. Top Anchor % ≥ 70%).  
+
+Recommended setting: **Only apply when Top Anchor matches your CTA list**, so you don’t accidentally hide a genuinely popular page whose top anchor is meaningful.
+"""
+        )
 
 
 
