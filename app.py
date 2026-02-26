@@ -1,3 +1,12 @@
+# app.py
+# Streamlit Cloud–ready: Screaming Frog "All Inlinks" Analyzer (chunk-safe)
+# - Upload .csv / .csv.gz / .zip (Mac Finder "Compress")
+# - Chunk processing to avoid memory crashes on large exports
+# - Row-level filters + destination-level filter (Top Anchor % dominance)
+# - Filter impact summary (rows removed by each filter)
+# - Downloads: Top N destinations, ALL destinations, optional filtered links CSV
+# - NEW: Exclude external Destination links by allowed domain(s)
+
 import re
 import zipfile
 import tempfile
@@ -38,6 +47,11 @@ class AppConfig:
     remove_self: bool
     exclude_params: bool
 
+    # NEW: external destination filtering
+    exclude_external_destinations: bool
+    allowed_destination_domains: Set[str]
+    keep_relative_destinations_as_internal: bool
+
     type_keep: List[str]
     follow_keep: List[str]
     status_keep: List[str]
@@ -76,6 +90,7 @@ class FilterStats:
     # removed by each step (row-level)
     removed_self: int
     removed_params: int
+    removed_external_destination: int  # NEW
     removed_type: int
     removed_follow: int
     removed_status: int
@@ -135,6 +150,45 @@ def uniq_values(df: pd.DataFrame, col: str) -> List[str]:
         return []
     vals = df[col].astype("string").fillna("").unique().tolist()
     return sorted(vals, key=lambda x: (x == "" or x is None, str(x).lower()))
+
+
+def normalize_host(h: str) -> str:
+    h = (h or "").strip().lower()
+    if h.startswith("www."):
+        h = h[4:]
+    return h
+
+
+def is_internal_destination(dest: str, allowed_domains: Set[str], keep_relative: bool = True) -> bool:
+    """
+    True if:
+    - Destination is relative (no scheme/netloc) and keep_relative=True
+    - OR destination host equals / is a subdomain of an allowed domain
+    """
+    if dest is None or pd.isna(dest):
+        return False
+    dest = str(dest).strip()
+    if not dest:
+        return False
+
+    parts = urlsplit(dest)
+
+    # Relative URLs (e.g. /about, about, ../x). Screaming Frog may output absolute or relative depending on export.
+    if parts.scheme == "" and parts.netloc == "":
+        return keep_relative
+
+    host = normalize_host(parts.netloc)
+    if not host:
+        return False
+
+    for ad in allowed_domains:
+        ad = normalize_host(ad)
+        if not ad:
+            continue
+        if host == ad or host.endswith("." + ad):
+            return True
+
+    return False
 
 
 # =========================
@@ -224,7 +278,19 @@ def apply_row_filters_with_stats(chunk: pd.DataFrame, cfg: AppConfig, stats: Fil
         chunk = chunk[~chunk["Destination"].str.contains(r"\?", regex=True, na=False)]
         stats.removed_params += (before - len(chunk))
 
-    # (3) Include-only filters (only apply if selection non-empty and col exists)
+    # (3) NEW: Exclude external destinations (if enabled and domains provided)
+    if cfg.exclude_external_destinations:
+        if cfg.allowed_destination_domains:
+            before = len(chunk)
+            dests = chunk["Destination"].astype("string").fillna("")
+            mask = dests.map(lambda d: is_internal_destination(d, cfg.allowed_destination_domains, cfg.keep_relative_destinations_as_internal))
+            chunk = chunk[mask]
+            stats.removed_external_destination += (before - len(chunk))
+        else:
+            # No domains provided: skip filter to avoid nuking everything
+            pass
+
+    # (4) Include-only filters (only apply if selection non-empty and col exists)
     if cfg.type_keep and "Type" in chunk.columns:
         before = len(chunk)
         chunk = chunk[chunk["Type"].astype("string").fillna("").isin(cfg.type_keep)]
@@ -245,14 +311,14 @@ def apply_row_filters_with_stats(chunk: pd.DataFrame, cfg: AppConfig, stats: Fil
         chunk = chunk[chunk["Link Position"].astype("string").fillna("").isin(cfg.link_position_keep)]
         stats.removed_link_position += (before - len(chunk))
 
-    # (4) Link Path exclusions
+    # (5) Link Path exclusions
     if cfg.rx_link_path_excl is not None and "Link Path" in chunk.columns:
         before = len(chunk)
         lp = chunk["Link Path"].astype("string").fillna("")
         chunk = chunk[~lp.str.contains(cfg.rx_link_path_excl, na=False)]
         stats.removed_link_path += (before - len(chunk))
 
-    # (5) Anchor exclusions (row-level)
+    # (6) Anchor exclusions (row-level)
     if cfg.rx_anchor_excl is not None and "Anchor" in chunk.columns:
         before = len(chunk)
         anc = chunk["Anchor"].astype("string").fillna("")
@@ -412,6 +478,28 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
     with c3:
         st.caption("Tip: leave include-only filters empty to keep all values.")
 
+    # NEW: External destination exclusion controls
+    st.markdown("### 🌐 Destination domain filter")
+    exclude_external_destinations = st.checkbox(
+        "Exclude external Destination links (keep only allowed domains)",
+        value=True,
+        help="Keeps Destination URLs that match the allowed domain(s). Removes other domains.",
+    )
+    allowed_domains_text = st.text_input(
+        "Allowed destination domain(s) (comma-separated)",
+        value="",
+        help="Example: so.energy, blog.so.energy",
+    )
+    keep_relative_destinations = st.checkbox(
+        "Treat relative Destination URLs as internal",
+        value=True,
+        help="Keeps destinations like /blog/post even if they have no domain.",
+    )
+    allowed_domains = set(d.strip() for d in (allowed_domains_text or "").split(",") if d.strip())
+
+    if exclude_external_destinations and not allowed_domains:
+        st.warning("External destination exclusion is ON, but no allowed domains were provided. The filter will be skipped.")
+
     default_type = ["Hyperlink"] if "Hyperlink" in type_options else []
     default_follow = ["Follow"] if "Follow" in follow_options else []
     default_status = ["200"] if "200" in status_options else (["200 OK"] if "200 OK" in status_options else [])
@@ -431,7 +519,12 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
     st.markdown("### Exclude by Link Path patterns (breadcrumbs/nav etc.)")
     exclude_by_link_path = st.checkbox("Enable Link Path exclusions", value=True)
     default_lp = "\n".join(["breadcrumb", "/ol/li", "aria-label=\"breadcrumb\"", "aria-label='breadcrumb'"])
-    lp_text = st.text_area("Link Path patterns to exclude (one per line)", value=default_lp, height=100, disabled=not exclude_by_link_path)
+    lp_text = st.text_area(
+        "Link Path patterns to exclude (one per line)",
+        value=default_lp,
+        height=100,
+        disabled=not exclude_by_link_path,
+    )
     rx_link_path_excl = compile_contains_patterns(lp_text) if exclude_by_link_path else None
 
     st.markdown("### 🚫 Exclude by Anchor text (template CTAs etc.)")
@@ -470,6 +563,10 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
 
         remove_self=remove_self,
         exclude_params=exclude_params,
+
+        exclude_external_destinations=exclude_external_destinations,
+        allowed_destination_domains=allowed_domains,
+        keep_relative_destinations_as_internal=keep_relative_destinations,
 
         type_keep=type_keep,
         follow_keep=follow_keep,
@@ -533,6 +630,7 @@ if run:
         total_rows_kept=0,
         removed_self=0,
         removed_params=0,
+        removed_external_destination=0,
         removed_type=0,
         removed_follow=0,
         removed_status=0,
@@ -595,9 +693,10 @@ if run:
     # =========================
     st.subheader("📊 Filter impact summary")
 
-    total_removed = (
+    total_removed_tracked = (
         stats.removed_self
         + stats.removed_params
+        + stats.removed_external_destination
         + stats.removed_type
         + stats.removed_follow
         + stats.removed_status
@@ -612,19 +711,19 @@ if run:
     with c2:
         st.metric("Rows kept", f"{stats.total_rows_kept:,}")
     with c3:
-        st.metric("Rows removed (tracked)", f"{total_removed:,}")
+        st.metric("Rows removed (tracked)", f"{total_removed_tracked:,}")
     with c4:
-        # sanity: some rows might be removed by multiple filters sequentially; tracked removals sum should equal read-kept
         st.metric("Read - kept", f"{(stats.total_rows_read - stats.total_rows_kept):,}")
 
     st.caption(
-        "Removals below are counted sequentially per chunk (each filter sees the remaining rows). "
+        "Removals are counted sequentially per chunk (each filter sees remaining rows). "
         "These should sum to Read - Kept."
     )
 
     breakdown = pd.DataFrame([
         {"Filter": "Remove self-referring", "Rows removed": stats.removed_self},
         {"Filter": "Exclude query params", "Rows removed": stats.removed_params},
+        {"Filter": "Exclude external destinations", "Rows removed": stats.removed_external_destination},
         {"Filter": "Type include-only", "Rows removed": stats.removed_type},
         {"Filter": "Follow include-only", "Rows removed": stats.removed_follow},
         {"Filter": "Status Code include-only", "Rows removed": stats.removed_status},
@@ -632,7 +731,6 @@ if run:
         {"Filter": "Link Path exclusions", "Rows removed": stats.removed_link_path},
         {"Filter": "Anchor exclusions", "Rows removed": stats.removed_anchor},
     ])
-
     st.dataframe(breakdown, use_container_width=True)
 
     st.caption(
@@ -678,15 +776,13 @@ if run:
         if cfg.max_filtered_rows and agg.filtered_rows_written >= int(cfg.max_filtered_rows):
             st.info(f"Filtered CSV was capped at **{agg.filtered_rows_written:,} rows** (max rows setting).")
 
-    with st.expander("How the CTA/template filters work"):
+    with st.expander("Notes"):
         st.markdown(
             """
-**Anchor exclusions (row-level)**  
-Removes individual links where the **Anchor** contains any excluded phrase (case-insensitive).
-
-**Top Anchor % filter (destination-level)**  
-After computing top anchors, you can remove destinations where one anchor dominates (e.g. ≥ 70%).  
-Recommended: only apply this when the Top Anchor is one of your CTA phrases.
+- **External destinations**: if enabled, only Destination URLs whose host matches (or is a subdomain of) an allowed domain are kept.
+  Relative URLs like `/blog/post` are treated as internal when the checkbox is enabled.
+- **Anchor exclusions** remove individual rows based on Anchor text (useful for template CTAs).
+- **Top Anchor % filter** removes entire destinations that are dominated by a CTA anchor (optional).
 """
         )
 
