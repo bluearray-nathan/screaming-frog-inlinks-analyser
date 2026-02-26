@@ -1,6 +1,9 @@
 # app.py
 # Streamlit Cloud–ready: Screaming Frog "All Inlinks" Analyzer (chunk-safe)
-# Adds: Focus Page Priority Report (focus pages are DESTINATION targets only)
+# Focus Page Priority Report (focus pages are DESTINATION targets only)
+# Changes:
+# - Removed: "🧠 Optional: template CTA dominance filter (Top Anchor %)" (UI + logic + stats)
+# - Added: Source page path exclusion filter (e.g. exclude sources containing /page/)
 
 import re
 import zipfile
@@ -55,13 +58,8 @@ class AppConfig:
     rx_link_path_excl: Optional[re.Pattern]
     rx_anchor_excl: Optional[re.Pattern]
 
-    # Destination-level filter
-    enable_anchor_dominance_filter: bool
-    dominance_threshold: int
-    only_apply_dominance_when_top_anchor_is_cta: bool
-
-    # CTA list for dominance "only when CTA"
-    cta_phrases_norm: Set[str]
+    # NEW: Source page path exclusion (row-level)
+    rx_source_path_excl: Optional[re.Pattern]
 
 
 @dataclass
@@ -91,8 +89,8 @@ class FilterStats:
     removed_link_path: int
     removed_anchor: int
 
-    destinations_before: int
-    destinations_removed_by_dominance: int
+    # NEW
+    removed_source_path: int
 
 
 # =========================
@@ -112,14 +110,6 @@ def normalize_url_for_compare(u: str) -> str:
     if path != "/" and path.endswith("/"):
         path = path.rstrip("/")
     return urlunsplit((scheme, netloc, path, parts.query, ""))  # drop fragment
-
-
-def norm_anchor_text(a: str) -> str:
-    """Normalize anchor for comparisons (CTA list): trim, collapse whitespace, lowercase."""
-    a = "" if a is None else str(a)
-    a = a.strip()
-    a = re.sub(r"\s+", " ", a)
-    return a.lower()
 
 
 def compile_contains_patterns(lines: str) -> Optional[re.Pattern]:
@@ -178,6 +168,21 @@ def is_internal_destination(dest: str, allowed_domains: Set[str], keep_relative:
             return True
 
     return False
+
+
+def source_path_only(src: str) -> str:
+    """
+    Returns just the path portion of the Source.
+    - If absolute URL: returns parts.path
+    - If relative/path-only: returns the string path as-is (via urlsplit)
+    """
+    if src is None or pd.isna(src):
+        return ""
+    s = str(src).strip()
+    if not s:
+        return ""
+    parts = urlsplit(s)
+    return parts.path or ""
 
 
 def focus_key(url: str) -> str:
@@ -282,7 +287,7 @@ def apply_row_filters_with_stats(chunk: pd.DataFrame, cfg: AppConfig, stats: Fil
         chunk = chunk[src_norm != dst_norm]
         stats.removed_self += (before - len(chunk))
 
-    # 2) query params
+    # 2) query params (Destination)
     if cfg.exclude_params:
         before = len(chunk)
         chunk = chunk[~chunk["Destination"].str.contains(r"\?", regex=True, na=False)]
@@ -292,11 +297,24 @@ def apply_row_filters_with_stats(chunk: pd.DataFrame, cfg: AppConfig, stats: Fil
     if cfg.exclude_external_destinations and cfg.allowed_destination_domains:
         before = len(chunk)
         dests = chunk["Destination"].astype("string").fillna("")
-        mask = dests.map(lambda d: is_internal_destination(d, cfg.allowed_destination_domains, cfg.keep_relative_destinations_as_internal))
+        mask = dests.map(
+            lambda d: is_internal_destination(
+                d,
+                cfg.allowed_destination_domains,
+                cfg.keep_relative_destinations_as_internal
+            )
+        )
         chunk = chunk[mask]
         stats.removed_external_destination += (before - len(chunk))
 
-    # 4) include-only filters
+    # 4) NEW: exclude by Source PATH patterns (e.g. /page/)
+    if cfg.rx_source_path_excl is not None:
+        before = len(chunk)
+        src_paths = chunk["Source"].map(source_path_only).astype("string").fillna("")
+        chunk = chunk[~src_paths.str.contains(cfg.rx_source_path_excl, na=False)]
+        stats.removed_source_path += (before - len(chunk))
+
+    # 5) include-only filters
     if cfg.type_keep and "Type" in chunk.columns:
         before = len(chunk)
         chunk = chunk[chunk["Type"].astype("string").fillna("").isin(cfg.type_keep)]
@@ -317,14 +335,14 @@ def apply_row_filters_with_stats(chunk: pd.DataFrame, cfg: AppConfig, stats: Fil
         chunk = chunk[chunk["Link Position"].astype("string").fillna("").isin(cfg.link_position_keep)]
         stats.removed_link_position += (before - len(chunk))
 
-    # 5) link path exclusion
+    # 6) link path exclusion
     if cfg.rx_link_path_excl is not None and "Link Path" in chunk.columns:
         before = len(chunk)
         lp = chunk["Link Path"].astype("string").fillna("")
         chunk = chunk[~lp.str.contains(cfg.rx_link_path_excl, na=False)]
         stats.removed_link_path += (before - len(chunk))
 
-    # 6) anchor exclusion
+    # 7) anchor exclusion
     if cfg.rx_anchor_excl is not None and "Anchor" in chunk.columns:
         before = len(chunk)
         anc = chunk["Anchor"].astype("string").fillna("")
@@ -399,26 +417,6 @@ def compute_top_anchor_fields(destinations: List[str], agg: Aggregates) -> Tuple
         top_anchor_pct.append(round(pct, 2))
 
     return top_anchor, top_anchor_pct
-
-
-def apply_destination_level_filters(out: pd.DataFrame, cfg: AppConfig, stats: FilterStats) -> pd.DataFrame:
-    stats.destinations_before = len(out)
-
-    if not cfg.enable_anchor_dominance_filter:
-        stats.destinations_removed_by_dominance = 0
-        return out
-
-    thr = float(cfg.dominance_threshold)
-
-    if cfg.only_apply_dominance_when_top_anchor_is_cta:
-        norm_top = out["Top Anchor"].map(norm_anchor_text)
-        is_cta = norm_top.isin(cfg.cta_phrases_norm)
-        filtered = out[~(is_cta & (out["Top Anchor %"] >= thr))]
-    else:
-        filtered = out[out["Top Anchor %"] < thr]
-
-    stats.destinations_removed_by_dominance = len(out) - len(filtered)
-    return filtered
 
 
 # =========================
@@ -520,6 +518,20 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
         status_keep = st.multiselect("Keep Status Code values (empty = keep all)", status_options, default=default_status)
         link_position_keep = st.multiselect("Keep Link Position values (empty = keep all)", linkpos_options, default=default_linkpos)
 
+    # NEW: Exclude by SOURCE page path patterns
+    st.markdown("### 🚫 Exclude by Source page path (e.g. pagination)")
+    enable_source_path_exclusions = st.checkbox("Enable Source path exclusions", value=True)
+
+    default_source_path_excl = "\n".join(["/page/"])
+    source_path_excl_text = st.text_area(
+        "Source path patterns to exclude (one per line, 'contains' match)",
+        value=default_source_path_excl,
+        height=80,
+        disabled=not enable_source_path_exclusions,
+        help="Matches against Source PATH only. Example: /page/ excludes sources like /blog/page/2/.",
+    )
+    rx_source_path_excl = compile_contains_patterns(source_path_excl_text) if enable_source_path_exclusions else None
+
     st.markdown("### Exclude by Link Path patterns (breadcrumbs/nav etc.)")
     exclude_by_link_path = st.checkbox("Enable Link Path exclusions", value=True)
     default_lp = "\n".join(["breadcrumb", "/ol/li", "aria-label=\"breadcrumb\"", "aria-label='breadcrumb'"])
@@ -536,21 +548,6 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
         disabled=not enable_anchor_exclusions,
     )
     rx_anchor_excl = compile_contains_patterns(anchor_excl_text) if enable_anchor_exclusions else None
-
-    cta_phrases_norm = set()
-    for line in (anchor_excl_text or "").splitlines():
-        t = norm_anchor_text(line)
-        if t:
-            cta_phrases_norm.add(t)
-
-    st.markdown("### 🧠 Optional: template CTA dominance filter (Top Anchor %)")
-    enable_anchor_dominance_filter = st.checkbox("Enable Top Anchor % filter", value=False)
-    dominance_threshold = st.slider("Exclude destinations with Top Anchor % ≥", 0, 100, 70, 1, disabled=not enable_anchor_dominance_filter)
-    only_apply_dominance_when_top_anchor_is_cta = st.checkbox(
-        "Only apply Top Anchor % filter when Top Anchor matches CTA list above",
-        value=True,
-        disabled=not enable_anchor_dominance_filter,
-    )
 
     return AppConfig(
         chunksize=int(chunksize),
@@ -575,11 +572,7 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
         rx_link_path_excl=rx_link_path_excl,
         rx_anchor_excl=rx_anchor_excl,
 
-        enable_anchor_dominance_filter=enable_anchor_dominance_filter,
-        dominance_threshold=int(dominance_threshold),
-        only_apply_dominance_when_top_anchor_is_cta=only_apply_dominance_when_top_anchor_is_cta,
-
-        cta_phrases_norm=cta_phrases_norm,
+        rx_source_path_excl=rx_source_path_excl,
     )
 
 
@@ -613,7 +606,6 @@ def build_focus_report(dest_summary: pd.DataFrame, focus_df: pd.DataFrame, url_c
 
     # Metric numeric (coerce)
     metric_raw = f[metric_col].astype("string").fillna("")
-    # strip commas and spaces
     metric_num = pd.to_numeric(metric_raw.str.replace(",", "", regex=False).str.strip(), errors="coerce").fillna(0.0)
     f["__metric"] = metric_num
 
@@ -628,11 +620,9 @@ def build_focus_report(dest_summary: pd.DataFrame, focus_df: pd.DataFrame, url_c
         how="inner",
     )
 
-    # If focus URLs are path-only but Destination is absolute (or vice versa), keep Destination as canonical in output
     merged.rename(columns={"__metric": "Focus Metric"}, inplace=True)
 
     # Deficit score (simple, robust)
-    # Higher deficit => fewer unique sources
     merged["Deficit Score"] = 1.0 / (merged["Unique_Source_Pages"].astype(float) + 1.0)
 
     # Value score normalized within focus set
@@ -645,7 +635,6 @@ def build_focus_report(dest_summary: pd.DataFrame, focus_df: pd.DataFrame, url_c
     # Priority
     merged["Priority Score"] = merged["Deficit Score"] * merged["Value Score"]
 
-    # Clean columns
     out_cols = [
         "Destination",
         "Focus Metric",
@@ -659,7 +648,6 @@ def build_focus_report(dest_summary: pd.DataFrame, focus_df: pd.DataFrame, url_c
     ]
     out = merged[out_cols].copy()
 
-    # Sort by priority, then value metric
     out = out.sort_values(["Priority Score", "Focus Metric"], ascending=False).reset_index(drop=True)
     return out
 
@@ -708,7 +696,6 @@ if focus_df is not None and not focus_df.empty:
     with c1:
         focus_url_col = st.selectbox("Select URL column", options=cols, index=0)
     with c2:
-        # default metric to second col if exists
         metric_default_index = 1 if len(cols) > 1 else 0
         focus_metric_col = st.selectbox("Select Metric column (numeric)", options=cols, index=metric_default_index)
 
@@ -750,8 +737,7 @@ if run:
         removed_link_position=0,
         removed_link_path=0,
         removed_anchor=0,
-        destinations_before=0,
-        destinations_removed_by_dominance=0,
+        removed_source_path=0,
     )
 
     progress = st.progress(0, text="Reading file in chunks...")
@@ -794,7 +780,6 @@ if run:
         "Top Anchor %": top_anchor_pct,
     })
 
-    out = apply_destination_level_filters(out, cfg, stats)
     out = out.sort_values(["Total_Inlinks", "Unique_Source_Pages"], ascending=False).reset_index(drop=True)
 
     # =========================
@@ -806,6 +791,7 @@ if run:
         stats.removed_self
         + stats.removed_params
         + stats.removed_external_destination
+        + stats.removed_source_path
         + stats.removed_type
         + stats.removed_follow
         + stats.removed_status
@@ -828,6 +814,7 @@ if run:
         {"Filter": "Remove self-referring", "Rows removed": stats.removed_self},
         {"Filter": "Exclude query params", "Rows removed": stats.removed_params},
         {"Filter": "Exclude external destinations", "Rows removed": stats.removed_external_destination},
+        {"Filter": "Source path exclusions", "Rows removed": stats.removed_source_path},
         {"Filter": "Type include-only", "Rows removed": stats.removed_type},
         {"Filter": "Follow include-only", "Rows removed": stats.removed_follow},
         {"Filter": "Status Code include-only", "Rows removed": stats.removed_status},
@@ -836,11 +823,6 @@ if run:
         {"Filter": "Anchor exclusions", "Rows removed": stats.removed_anchor},
     ])
     st.dataframe(breakdown, use_container_width=True)
-
-    st.caption(
-        f"Destinations before destination-level filter: {stats.destinations_before:,} • "
-        f"Removed by Top Anchor % filter: {stats.destinations_removed_by_dominance:,}"
-    )
 
     # =========================
     # Focus Page Priority Report
@@ -917,7 +899,7 @@ if run:
             """
 - **Focus pages are destination targets only**. The report shows which of those targets have the biggest internal linking deficit.
 - Matching works for focus URLs that are **full URLs** or **path-only**. Destination URLs can also be full or path-only.
-- Priority Score is designed for V1.5 and becomes the natural target list for embeddings-based recommendations later.
+- Source path exclusion matches against **Source PATH only** (e.g. `/page/`), useful for excluding paginated listing pages from being counted as linking sources.
 """
         )
 
