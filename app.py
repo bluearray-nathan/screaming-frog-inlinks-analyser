@@ -1,19 +1,6 @@
 # app.py
 # Streamlit Cloud–ready: Screaming Frog "All Inlinks" Analyzer (chunk-safe)
-#
-# Includes:
-# - Upload .csv / .csv.gz / .zip (zip must contain a .csv)
-# - Chunk processing for large files
-# - Row-level filters + destination-level dominance filter
-# - Filter impact summary (rows removed by each filter)
-# - Top Destinations table + downloads (Top N + ALL)
-# - Optional filtered-links CSV download (same columns as input, filters applied)
-# - NEW: Exclude external Destination links by allowed domain(s)
-# - NEW: Focus Page Priority Report (upload focus CSV: URL + metric), destinations only
-#
-# Notes:
-# - Focus Pages uploader is shown near the top (expander) so you can’t miss it.
-# - Focus Report is shown first in the results if a focus CSV is provided.
+# Adds: Focus Page Priority Report (focus pages are DESTINATION targets only)
 
 import re
 import zipfile
@@ -27,26 +14,27 @@ import streamlit as st
 
 
 # =========================
-# Page Setup
+# Page / App Setup
 # =========================
 st.set_page_config(page_title="All Inlinks Analyzer (Chunk-safe)", layout="wide")
-st.title("🔗 Screaming Frog All Inlinks Analyzer")
+st.title("🔗 All Inlinks Analyzer (Chunk-safe for big files)")
 st.caption(
-    "Chunk-safe internal link analysis for large Screaming Frog **All Inlinks** exports. "
-    "Filter template noise, view top linked-to URLs, and (optionally) prioritise **Focus Pages**."
+    "Upload Screaming Frog All Inlinks (.csv, .csv.gz, or .zip), apply filters, and get Top Destinations + downloads."
 )
+
+uploaded_file = st.file_uploader("Upload All Inlinks (.csv, .csv.gz, or .zip)", type=["csv", "gz", "zip"])
 
 
 # =========================
-# Data Structures
+# Config / Data Structures
 # =========================
 @dataclass
 class AppConfig:
-    # Performance
     chunksize: int
+    sample_rows: int
     max_distinct_anchors_per_destination: int
 
-    # Output
+    # Output settings
     write_filtered_csv: bool
     max_filtered_rows: int  # 0 = unlimited
 
@@ -59,13 +47,11 @@ class AppConfig:
     allowed_destination_domains: Set[str]
     keep_relative_destinations_as_internal: bool
 
-    # Include-only filters (optional)
     type_keep: List[str]
     follow_keep: List[str]
     status_keep: List[str]
     link_position_keep: List[str]
 
-    # Pattern exclusions
     rx_link_path_excl: Optional[re.Pattern]
     rx_anchor_excl: Optional[re.Pattern]
 
@@ -73,6 +59,8 @@ class AppConfig:
     enable_anchor_dominance_filter: bool
     dominance_threshold: int
     only_apply_dominance_when_top_anchor_is_cta: bool
+
+    # CTA list for dominance "only when CTA"
     cta_phrases_norm: Set[str]
 
 
@@ -80,6 +68,7 @@ class AppConfig:
 class Aggregates:
     total_inlinks: Dict[str, int]
     unique_sources: Dict[str, Set[str]]
+
     anchor_total: Dict[str, int]                 # dest -> total non-empty anchor occurrences
     anchor_counts: Dict[str, Dict[str, int]]     # dest -> {anchor_text -> count} (capped)
 
@@ -107,7 +96,7 @@ class FilterStats:
 
 
 # =========================
-# Helpers
+# Helpers: normalization & patterns
 # =========================
 def normalize_url_for_compare(u: str) -> str:
     """Normalize for Source==Destination compare: lowercase scheme/host, trim trailing slash, drop fragment."""
@@ -122,7 +111,7 @@ def normalize_url_for_compare(u: str) -> str:
     path = parts.path or ""
     if path != "/" and path.endswith("/"):
         path = path.rstrip("/")
-    return urlunsplit((scheme, netloc, path, parts.query, ""))
+    return urlunsplit((scheme, netloc, path, parts.query, ""))  # drop fragment
 
 
 def norm_anchor_text(a: str) -> str:
@@ -134,7 +123,7 @@ def norm_anchor_text(a: str) -> str:
 
 
 def compile_contains_patterns(lines: str) -> Optional[re.Pattern]:
-    """One token per line, case-insensitive substring match."""
+    """One token per line, case-insensitive 'contains' match."""
     pats = []
     for line in (lines or "").splitlines():
         line = line.strip()
@@ -173,7 +162,7 @@ def is_internal_destination(dest: str, allowed_domains: Set[str], keep_relative:
 
     parts = urlsplit(dest)
 
-    # relative URLs (/x, x, ../x) -> treat as internal if enabled
+    # Relative URLs
     if parts.scheme == "" and parts.netloc == "":
         return keep_relative
 
@@ -187,14 +176,15 @@ def is_internal_destination(dest: str, allowed_domains: Set[str], keep_relative:
             continue
         if host == ad or host.endswith("." + ad):
             return True
+
     return False
 
 
 def focus_key(url: str) -> str:
     """
-    Robust join key for Focus URLs and Destination URLs:
-    - If absolute: host+path (no query/fragment), normalized host, trimmed trailing slash
-    - If relative/path-only: path only (leading slash enforced), trimmed trailing slash
+    Create a join key that matches focus URLs to Destination URLs robustly.
+    - If url is absolute: host+path (no query/fragment), lowercased host, trimmed trailing slash in path.
+    - If url is relative/path-only: path only (leading slash enforced), trimmed trailing slash.
     """
     if url is None or pd.isna(url):
         return ""
@@ -204,7 +194,7 @@ def focus_key(url: str) -> str:
 
     parts = urlsplit(s)
 
-    # Relative
+    # Relative (no scheme/netloc): treat as path
     if parts.scheme == "" and parts.netloc == "":
         p = parts.path if parts.path else s
         p = p.strip()
@@ -221,15 +211,19 @@ def focus_key(url: str) -> str:
     return f"{host}{path}"
 
 
+def destination_join_key(destination_url: str) -> str:
+    """
+    Join key for Destination URLs:
+    - If absolute: host+path
+    - If relative: path
+    """
+    return focus_key(destination_url)
+
+
 # =========================
-# IO helpers
+# IO: materialize upload + sample + chunk iterator
 # =========================
 def materialize_to_path(uploaded) -> str:
-    """
-    Save uploaded file to temp path.
-    - .zip: extract first .csv found
-    - .csv/.gz: write bytes as-is
-    """
     name = (uploaded.name or "").lower()
 
     if name.endswith(".zip"):
@@ -252,7 +246,7 @@ def materialize_to_path(uploaded) -> str:
     return tmp.name
 
 
-def read_sample(path: str, nrows: int = 50_000) -> pd.DataFrame:
+def read_sample(path: str, nrows: int) -> pd.DataFrame:
     kwargs = dict(nrows=int(nrows), low_memory=False, dtype="string", compression="infer")
     try:
         return pd.read_csv(path, **kwargs)
@@ -270,20 +264,8 @@ def chunk_iterator(path: str, chunksize: int):
         return pd.read_csv(path, **kwargs)
 
 
-def load_focus_pages_csv(uploaded) -> Optional[pd.DataFrame]:
-    if uploaded is None:
-        return None
-    kwargs = dict(low_memory=False, dtype="string")
-    try:
-        df = pd.read_csv(uploaded, **kwargs)
-    except UnicodeDecodeError:
-        uploaded.seek(0)
-        df = pd.read_csv(uploaded, encoding="cp1252", **kwargs)
-    return df
-
-
 # =========================
-# Filtering (row-level) + stats
+# Filtering: apply row-level filters with per-step stats
 # =========================
 def apply_row_filters_with_stats(chunk: pd.DataFrame, cfg: AppConfig, stats: FilterStats) -> pd.DataFrame:
     if "Source" not in chunk.columns or "Destination" not in chunk.columns:
@@ -300,7 +282,7 @@ def apply_row_filters_with_stats(chunk: pd.DataFrame, cfg: AppConfig, stats: Fil
         chunk = chunk[src_norm != dst_norm]
         stats.removed_self += (before - len(chunk))
 
-    # 2) query params in destination
+    # 2) query params
     if cfg.exclude_params:
         before = len(chunk)
         chunk = chunk[~chunk["Destination"].str.contains(r"\?", regex=True, na=False)]
@@ -379,7 +361,6 @@ def update_aggregates_from_chunk(chunk: pd.DataFrame, cfg: AppConfig, agg: Aggre
             continue
 
         agg.anchor_total[d] = agg.anchor_total.get(d, 0) + 1
-
         dest_map = agg.anchor_counts.get(d)
         if dest_map is None:
             dest_map = {}
@@ -393,7 +374,7 @@ def update_aggregates_from_chunk(chunk: pd.DataFrame, cfg: AppConfig, agg: Aggre
 
 
 # =========================
-# Destination summary building
+# Output table building
 # =========================
 def compute_top_anchor_fields(destinations: List[str], agg: Aggregates) -> Tuple[List[str], List[float]]:
     top_anchor = []
@@ -461,59 +442,13 @@ def maybe_write_filtered_chunk(chunk: pd.DataFrame, cfg: AppConfig, agg: Aggrega
 
 
 # =========================
-# Focus Report
-# =========================
-def build_focus_report(dest_summary: pd.DataFrame, focus_df: pd.DataFrame, url_col: str, metric_col: str) -> pd.DataFrame:
-    f = focus_df.copy()
-
-    f["__focus_url"] = f[url_col].astype("string").fillna("")
-    f["__focus_key"] = f["__focus_url"].map(focus_key)
-
-    metric_raw = f[metric_col].astype("string").fillna("")
-    metric_num = pd.to_numeric(metric_raw.str.replace(",", "", regex=False).str.strip(), errors="coerce").fillna(0.0)
-    f["Focus Metric"] = metric_num
-
-    d = dest_summary.copy()
-    d["__dest_key"] = d["Destination"].astype("string").fillna("").map(focus_key)
-
-    merged = d.merge(
-        f[["__focus_key", "__focus_url", "Focus Metric"]],
-        left_on="__dest_key",
-        right_on="__focus_key",
-        how="inner",
-    )
-
-    # deficit score (simple + stable)
-    merged["Deficit Score"] = 1.0 / (merged["Unique_Source_Pages"].astype(float) + 1.0)
-
-    # value score normalised within focus set
-    max_metric = float(merged["Focus Metric"].max()) if len(merged) else 0.0
-    merged["Value Score"] = (merged["Focus Metric"].astype(float) / max_metric) if max_metric > 0 else 0.0
-
-    merged["Priority Score"] = merged["Deficit Score"] * merged["Value Score"]
-
-    out_cols = [
-        "Destination",
-        "Focus Metric",
-        "Value Score",
-        "Unique_Source_Pages",
-        "Total_Inlinks",
-        "Deficit Score",
-        "Priority Score",
-        "Top Anchor",
-        "Top Anchor %",
-    ]
-    out = merged[out_cols].copy()
-    out = out.sort_values(["Priority Score", "Focus Metric"], ascending=False).reset_index(drop=True)
-    return out
-
-
-# =========================
-# Sidebar: Settings & Filters
+# UI: Build config
 # =========================
 def build_config(sample_df: pd.DataFrame) -> AppConfig:
     st.sidebar.header("⚙️ Performance")
     chunksize = st.sidebar.number_input("Chunk size (rows)", 50_000, 1_000_000, 200_000, 50_000)
+    sample_rows = st.sidebar.number_input("Sample rows (detect filter values)", 5_000, 200_000, 50_000, 5_000)
+
     max_distinct = st.sidebar.number_input(
         "Max distinct anchors tracked per destination",
         min_value=25,
@@ -532,39 +467,43 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
         step=100_000,
     )
 
-    # Filter options based on sample
     type_options = uniq_values(sample_df, "Type")
     follow_options = uniq_values(sample_df, "Follow")
     status_options = uniq_values(sample_df, "Status Code")
     linkpos_options = uniq_values(sample_df, "Link Position")
 
-    st.sidebar.header("🧹 Filters")
-    preset = st.sidebar.button("✨ Preset: Content + Follow + 200 + Hyperlink")
+    st.subheader("🎛️ Filters")
+    preset = st.button("✨ Preset: Content + Follow + 200 + Hyperlink")
 
-    remove_self = st.sidebar.checkbox("Remove self-referring (Source == Destination)", value=True)
-    exclude_params = st.sidebar.checkbox("Exclude Destination with '?' (query params)", value=True)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        remove_self = st.checkbox("Remove self-referring (Source == Destination)", value=True)
+    with c2:
+        exclude_params = st.checkbox("Exclude Destination with '?' (query params)", value=True)
+    with c3:
+        st.caption("Tip: leave include-only filters empty to keep all values.")
 
-    st.sidebar.markdown("### 🌐 Destination domain filter")
-    exclude_external_destinations = st.sidebar.checkbox(
-        "Exclude external Destination links",
+    st.markdown("### 🌐 Destination domain filter")
+    exclude_external_destinations = st.checkbox(
+        "Exclude external Destination links (keep only allowed domains)",
         value=True,
         help="Keeps Destination URLs that match allowed domain(s). Removes other domains.",
     )
-    allowed_domains_text = st.sidebar.text_input(
-        "Allowed domain(s) (comma-separated)",
+    allowed_domains_text = st.text_input(
+        "Allowed destination domain(s) (comma-separated)",
         value="",
         help="Example: so.energy, blog.so.energy",
     )
-    keep_relative_destinations = st.sidebar.checkbox(
-        "Treat relative Destinations as internal",
+    keep_relative_destinations = st.checkbox(
+        "Treat relative Destination URLs as internal",
         value=True,
         help="Keeps destinations like /blog/post even if they have no domain.",
     )
     allowed_domains = set(d.strip() for d in (allowed_domains_text or "").split(",") if d.strip())
-    if exclude_external_destinations and not allowed_domains:
-        st.sidebar.warning("Enabled, but no domains provided → filter will be skipped.")
 
-    # defaults
+    if exclude_external_destinations and not allowed_domains:
+        st.warning("External destination exclusion is ON, but no allowed domains were provided. The filter will be skipped.")
+
     default_type = ["Hyperlink"] if "Hyperlink" in type_options else []
     default_follow = ["Follow"] if "Follow" in follow_options else []
     default_status = ["200"] if "200" in status_options else (["200 OK"] if "200 OK" in status_options else [])
@@ -576,24 +515,24 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
         status_keep = default_status
         link_position_keep = default_linkpos
     else:
-        type_keep = st.sidebar.multiselect("Keep Type (empty = all)", type_options, default=default_type)
-        follow_keep = st.sidebar.multiselect("Keep Follow (empty = all)", follow_options, default=default_follow)
-        status_keep = st.sidebar.multiselect("Keep Status Code (empty = all)", status_options, default=default_status)
-        link_position_keep = st.sidebar.multiselect("Keep Link Position (empty = all)", linkpos_options, default=default_linkpos)
+        type_keep = st.multiselect("Keep Type values (empty = keep all)", type_options, default=default_type)
+        follow_keep = st.multiselect("Keep Follow values (empty = keep all)", follow_options, default=default_follow)
+        status_keep = st.multiselect("Keep Status Code values (empty = keep all)", status_options, default=default_status)
+        link_position_keep = st.multiselect("Keep Link Position values (empty = keep all)", linkpos_options, default=default_linkpos)
 
-    st.sidebar.markdown("### 🧭 Link Path exclusions")
-    exclude_by_link_path = st.sidebar.checkbox("Enable Link Path exclusions", value=True)
+    st.markdown("### Exclude by Link Path patterns (breadcrumbs/nav etc.)")
+    exclude_by_link_path = st.checkbox("Enable Link Path exclusions", value=True)
     default_lp = "\n".join(["breadcrumb", "/ol/li", "aria-label=\"breadcrumb\"", "aria-label='breadcrumb'"])
-    lp_text = st.sidebar.text_area("Link Path patterns (one per line)", value=default_lp, height=110, disabled=not exclude_by_link_path)
+    lp_text = st.text_area("Link Path patterns to exclude (one per line)", value=default_lp, height=100, disabled=not exclude_by_link_path)
     rx_link_path_excl = compile_contains_patterns(lp_text) if exclude_by_link_path else None
 
-    st.sidebar.markdown("### 🚫 Anchor exclusions")
-    enable_anchor_exclusions = st.sidebar.checkbox("Enable Anchor exclusions", value=True)
+    st.markdown("### 🚫 Exclude by Anchor text (template CTAs etc.)")
+    enable_anchor_exclusions = st.checkbox("Enable Anchor exclusions", value=True)
     default_anchor_excl = "\n".join(["discover more", "read more", "learn more", "find out more", "view more", "see more"])
-    anchor_excl_text = st.sidebar.text_area(
-        "Anchor phrases (one per line)",
+    anchor_excl_text = st.text_area(
+        "Anchor phrases to exclude (one per line, 'contains' match)",
         value=default_anchor_excl,
-        height=130,
+        height=120,
         disabled=not enable_anchor_exclusions,
     )
     rx_anchor_excl = compile_contains_patterns(anchor_excl_text) if enable_anchor_exclusions else None
@@ -604,17 +543,18 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
         if t:
             cta_phrases_norm.add(t)
 
-    st.sidebar.markdown("### 🧠 Destination-level filter")
-    enable_anchor_dominance_filter = st.sidebar.checkbox("Enable Top Anchor % filter", value=False)
-    dominance_threshold = st.sidebar.slider("Exclude destinations if Top Anchor % ≥", 0, 100, 70, 1, disabled=not enable_anchor_dominance_filter)
-    only_apply_dominance_when_top_anchor_is_cta = st.sidebar.checkbox(
-        "Only apply when Top Anchor is a CTA phrase",
+    st.markdown("### 🧠 Optional: template CTA dominance filter (Top Anchor %)")
+    enable_anchor_dominance_filter = st.checkbox("Enable Top Anchor % filter", value=False)
+    dominance_threshold = st.slider("Exclude destinations with Top Anchor % ≥", 0, 100, 70, 1, disabled=not enable_anchor_dominance_filter)
+    only_apply_dominance_when_top_anchor_is_cta = st.checkbox(
+        "Only apply Top Anchor % filter when Top Anchor matches CTA list above",
         value=True,
         disabled=not enable_anchor_dominance_filter,
     )
 
     return AppConfig(
         chunksize=int(chunksize),
+        sample_rows=int(sample_rows),
         max_distinct_anchors_per_destination=int(max_distinct),
 
         write_filtered_csv=write_filtered_csv,
@@ -638,75 +578,151 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
         enable_anchor_dominance_filter=enable_anchor_dominance_filter,
         dominance_threshold=int(dominance_threshold),
         only_apply_dominance_when_top_anchor_is_cta=only_apply_dominance_when_top_anchor_is_cta,
+
         cta_phrases_norm=cta_phrases_norm,
     )
 
 
 # =========================
-# UI: Uploads (Main page)
+# Focus Pages (UI + parsing)
 # =========================
-all_inlinks_upload = uploaded_file
-if all_inlinks_upload is None:
+def load_focus_pages_csv(uploaded) -> Optional[pd.DataFrame]:
+    """Reads focus pages CSV with encoding fallback."""
+    if uploaded is None:
+        return None
+    kwargs = dict(low_memory=False, dtype="string")
+    try:
+        df = pd.read_csv(uploaded, **kwargs)
+    except UnicodeDecodeError:
+        uploaded.seek(0)
+        df = pd.read_csv(uploaded, encoding="cp1252", **kwargs)
+    return df
+
+
+def build_focus_report(dest_summary: pd.DataFrame, focus_df: pd.DataFrame, url_col: str, metric_col: str) -> pd.DataFrame:
+    """
+    dest_summary: Destination summary table (post-filters)
+    focus_df: user focus pages table
+    Returns focus report merged + priority scores.
+    """
+    f = focus_df.copy()
+
+    # Build focus keys
+    f["__focus_url"] = f[url_col].astype("string").fillna("")
+    f["__focus_key"] = f["__focus_url"].map(focus_key)
+
+    # Metric numeric (coerce)
+    metric_raw = f[metric_col].astype("string").fillna("")
+    # strip commas and spaces
+    metric_num = pd.to_numeric(metric_raw.str.replace(",", "", regex=False).str.strip(), errors="coerce").fillna(0.0)
+    f["__metric"] = metric_num
+
+    # Destination keys
+    d = dest_summary.copy()
+    d["__dest_key"] = d["Destination"].astype("string").fillna("").map(destination_join_key)
+
+    merged = d.merge(
+        f[["__focus_key", "__focus_url", "__metric"]],
+        left_on="__dest_key",
+        right_on="__focus_key",
+        how="inner",
+    )
+
+    # If focus URLs are path-only but Destination is absolute (or vice versa), keep Destination as canonical in output
+    merged.rename(columns={"__metric": "Focus Metric"}, inplace=True)
+
+    # Deficit score (simple, robust)
+    # Higher deficit => fewer unique sources
+    merged["Deficit Score"] = 1.0 / (merged["Unique_Source_Pages"].astype(float) + 1.0)
+
+    # Value score normalized within focus set
+    max_metric = float(merged["Focus Metric"].max()) if len(merged) else 0.0
+    if max_metric > 0:
+        merged["Value Score"] = merged["Focus Metric"].astype(float) / max_metric
+    else:
+        merged["Value Score"] = 0.0
+
+    # Priority
+    merged["Priority Score"] = merged["Deficit Score"] * merged["Value Score"]
+
+    # Clean columns
+    out_cols = [
+        "Destination",
+        "Focus Metric",
+        "Value Score",
+        "Unique_Source_Pages",
+        "Total_Inlinks",
+        "Deficit Score",
+        "Priority Score",
+        "Top Anchor",
+        "Top Anchor %",
+    ]
+    out = merged[out_cols].copy()
+
+    # Sort by priority, then value metric
+    out = out.sort_values(["Priority Score", "Focus Metric"], ascending=False).reset_index(drop=True)
+    return out
+
+
+# =========================
+# Main flow
+# =========================
+if uploaded_file is None:
     st.info("Upload an All Inlinks file to begin.")
     st.stop()
 
-# Focus uploader near the top (hard to miss)
-focus_df = None
-focus_url_col = None
-focus_metric_col = None
-
-with st.expander("🎯 Focus Page Priority Report (optional) — upload focus pages (DESTINATIONS) + a metric", expanded=False):
-    focus_upload = st.file_uploader(
-        "Upload Focus Pages CSV (URL + Metric)",
-        type=["csv"],
-        key="focus_csv_uploader",
-    )
-    focus_df = load_focus_pages_csv(focus_upload)
-    if focus_df is not None and not focus_df.empty:
-        st.success(f"Focus CSV loaded: {focus_df.shape[0]:,} rows × {focus_df.shape[1]:,} cols")
-        cols = list(focus_df.columns)
-        c1, c2 = st.columns(2)
-        with c1:
-            focus_url_col = st.selectbox("URL column", options=cols, index=0)
-        with c2:
-            metric_default = 1 if len(cols) > 1 else 0
-            focus_metric_col = st.selectbox("Metric column (numeric)", options=cols, index=metric_default)
-
-        st.caption(
-            "URLs can be full URLs (https://...) or paths (/solar/...). "
-            "Metric can be sessions, revenue, conversions, or a manual priority score."
-        )
-        with st.expander("Preview focus CSV"):
-            st.dataframe(focus_df.head(50), use_container_width=True)
-    else:
-        st.info("No focus CSV uploaded (or it’s empty). You’ll still get Top Destinations output.")
-
-
-# =========================
-# Load sample + build config
-# =========================
 try:
-    path = materialize_to_path(all_inlinks_upload)
+    path = materialize_to_path(uploaded_file)
 except Exception as e:
     st.error(f"Failed to read file: {e}")
     st.stop()
 
-sample_df = read_sample(path, 50_000)
-missing = {"Source", "Destination"} - set(sample_df.columns)
+sample_df_initial = read_sample(path, 50_000)
+missing = {"Source", "Destination"} - set(sample_df_initial.columns)
 if missing:
     st.error(f"Missing required columns: {', '.join(sorted(missing))}")
     st.stop()
 
-cfg = build_config(sample_df)
+cfg = build_config(sample_df_initial)
+
+st.divider()
+st.subheader("🎯 Focus Page Priority Report (optional)")
+focus_upload = st.file_uploader(
+    "Upload Focus Pages CSV (URL + Metric). Focus pages are treated as DESTINATION targets only.",
+    type=["csv"],
+    key="focus_csv",
+)
+
+focus_df = load_focus_pages_csv(focus_upload)
+
+focus_url_col = None
+focus_metric_col = None
+
+if focus_df is not None and not focus_df.empty:
+    st.success(f"Focus CSV loaded: {focus_df.shape[0]:,} rows × {focus_df.shape[1]:,} cols")
+    with st.expander("Preview focus CSV"):
+        st.dataframe(focus_df.head(50), use_container_width=True)
+
+    cols = list(focus_df.columns)
+    c1, c2 = st.columns(2)
+    with c1:
+        focus_url_col = st.selectbox("Select URL column", options=cols, index=0)
+    with c2:
+        # default metric to second col if exists
+        metric_default_index = 1 if len(cols) > 1 else 0
+        focus_metric_col = st.selectbox("Select Metric column (numeric)", options=cols, index=metric_default_index)
+
+    st.caption(
+        "Matching works if your focus URLs are full URLs (https://...) OR path-only (/solar/...). "
+        "Metric can be sessions, revenue, conversions, or a manual priority score."
+    )
+else:
+    st.info("No focus CSV uploaded — you’ll still get Top Destinations + downloads.")
 
 run = st.button("🚀 Run analysis", type="primary")
 
-
-# =========================
-# Run
-# =========================
 if run:
-    # init output file
+    # Init aggregates
     filtered_out_path = None
     if cfg.write_filtered_csv:
         tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
@@ -738,7 +754,7 @@ if run:
         destinations_removed_by_dominance=0,
     )
 
-    progress = st.progress(0, text="Reading file in chunks…")
+    progress = st.progress(0, text="Reading file in chunks...")
     wrote_header = False
     chunks_seen = 0
 
@@ -751,26 +767,26 @@ if run:
 
         if filtered.empty:
             if chunks_seen % 5 == 0:
-                progress.progress(min(0.99, chunks_seen / (chunks_seen + 50)), text=f"Processed {stats.total_rows_read:,} rows…")
+                progress.progress(min(0.99, chunks_seen / (chunks_seen + 50)), text=f"Processed {stats.total_rows_read:,} rows...")
             continue
 
         wrote_header = maybe_write_filtered_chunk(filtered, cfg, agg, wrote_header)
         update_aggregates_from_chunk(filtered, cfg, agg)
 
         if chunks_seen % 5 == 0:
-            progress.progress(min(0.99, chunks_seen / (chunks_seen + 50)), text=f"Processed {stats.total_rows_read:,} rows…")
+            progress.progress(min(0.99, chunks_seen / (chunks_seen + 50)), text=f"Processed {stats.total_rows_read:,} rows...")
 
     progress.progress(1.0, text=f"Done. Processed {stats.total_rows_read:,} rows.")
 
     if stats.total_rows_kept == 0:
-        st.warning("No rows matched your filters. Try loosening filters (e.g., disable anchor exclusions).")
+        st.warning("No rows matched your filters. Try clearing include-only filters or disabling Anchor exclusions.")
         st.stop()
 
     # Build destination summary
     destinations = list(agg.total_inlinks.keys())
     top_anchor, top_anchor_pct = compute_top_anchor_fields(destinations, agg)
 
-    dest_summary = pd.DataFrame({
+    out = pd.DataFrame({
         "Destination": destinations,
         "Total_Inlinks": [agg.total_inlinks[d] for d in destinations],
         "Unique_Source_Pages": [len(agg.unique_sources.get(d, set())) for d in destinations],
@@ -778,8 +794,8 @@ if run:
         "Top Anchor %": top_anchor_pct,
     })
 
-    dest_summary = apply_destination_level_filters(dest_summary, cfg, stats)
-    dest_summary = dest_summary.sort_values(["Total_Inlinks", "Unique_Source_Pages"], ascending=False).reset_index(drop=True)
+    out = apply_destination_level_filters(out, cfg, stats)
+    out = out.sort_values(["Total_Inlinks", "Unique_Source_Pages"], ascending=False).reset_index(drop=True)
 
     # =========================
     # Filter Impact Summary
@@ -798,11 +814,15 @@ if run:
         + stats.removed_anchor
     )
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Rows read", f"{stats.total_rows_read:,}")
-    m2.metric("Rows kept", f"{stats.total_rows_kept:,}")
-    m3.metric("Rows removed (tracked)", f"{total_removed_tracked:,}")
-    m4.metric("Read - kept", f"{(stats.total_rows_read - stats.total_rows_kept):,}")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Rows read", f"{stats.total_rows_read:,}")
+    with c2:
+        st.metric("Rows kept", f"{stats.total_rows_kept:,}")
+    with c3:
+        st.metric("Rows removed (tracked)", f"{total_removed_tracked:,}")
+    with c4:
+        st.metric("Read - kept", f"{(stats.total_rows_read - stats.total_rows_kept):,}")
 
     breakdown = pd.DataFrame([
         {"Filter": "Remove self-referring", "Rows removed": stats.removed_self},
@@ -823,28 +843,29 @@ if run:
     )
 
     # =========================
-    # Focus Page Priority Report (FIRST)
+    # Focus Page Priority Report
     # =========================
-    if focus_df is not None and not focus_df.empty and focus_url_col and focus_metric_col:
+    if focus_df is not None and focus_url_col and focus_metric_col:
         st.subheader("🎯 Focus Page Priority Report")
+
         try:
-            focus_report = build_focus_report(dest_summary, focus_df, focus_url_col, focus_metric_col)
+            focus_report = build_focus_report(out, focus_df, focus_url_col, focus_metric_col)
         except Exception as e:
             st.error(f"Failed to build Focus Page report: {e}")
             focus_report = pd.DataFrame()
 
         if focus_report.empty:
             st.warning(
-                "No focus pages matched Destination URLs after filtering.\n\n"
-                "Quick checks:\n"
-                "- Do focus URLs match the same paths as Destination?\n"
-                "- Were focus pages filtered out (e.g. by Status Code / Link Position / external domain)?\n"
-                "- If Destinations are absolute URLs, try focus URLs as absolute (or vice versa)."
+                "No focus pages matched the Destination URLs after filtering.\n\n"
+                "Common causes:\n"
+                "- Focus URLs are paths but Destination URLs are different paths (e.g. missing trailing segment)\n"
+                "- Focus list includes URLs filtered out (e.g. non-200, excluded by anchor/link path filters)\n"
+                "- Domain mismatch (if using external destination filtering)\n"
             )
         else:
-            st.caption("Priority Score = Deficit Score × Value Score (Value Score normalised within your focus set).")
-            show_n = st.number_input("Focus rows to show", 10, 5000, 200, 10)
-            st.dataframe(focus_report.head(int(show_n)), use_container_width=True)
+            st.caption("Priority Score = Deficit Score × Value Score (Value Score is normalized within focus set).")
+            rows_to_show = st.number_input("Focus report rows to show", min_value=10, max_value=2000, value=100, step=10)
+            st.dataframe(focus_report.head(int(rows_to_show)), use_container_width=True)
 
             st.download_button(
                 "Download Focus Page Priority Report CSV",
@@ -857,9 +878,9 @@ if run:
     # Top Destinations
     # =========================
     st.subheader("🏆 Top Destination URLs")
-    top_n = st.number_input("Rows to show (Top Destinations)", min_value=10, max_value=500, value=50, step=10)
-    top_dest = dest_summary.head(int(top_n))
-    st.dataframe(top_dest, use_container_width=True)
+    top_n = st.number_input("Rows to show", min_value=10, max_value=500, value=50, step=10)
+    out_top = out.head(int(top_n))
+    st.dataframe(out_top, use_container_width=True)
 
     # =========================
     # Downloads
@@ -868,14 +889,14 @@ if run:
 
     st.download_button(
         "Download top destinations CSV",
-        data=top_dest.to_csv(index=False).encode("utf-8"),
+        data=out_top.to_csv(index=False).encode("utf-8"),
         file_name="top_destinations.csv",
         mime="text/csv",
     )
 
     st.download_button(
         "Download ALL destinations CSV",
-        data=dest_summary.to_csv(index=False).encode("utf-8"),
+        data=out.to_csv(index=False).encode("utf-8"),
         file_name="all_destinations_summary.csv",
         mime="text/csv",
     )
@@ -890,6 +911,15 @@ if run:
             )
         if cfg.max_filtered_rows and agg.filtered_rows_written >= int(cfg.max_filtered_rows):
             st.info(f"Filtered CSV was capped at **{agg.filtered_rows_written:,} rows** (max rows setting).")
+
+    with st.expander("Notes"):
+        st.markdown(
+            """
+- **Focus pages are destination targets only**. The report shows which of those targets have the biggest internal linking deficit.
+- Matching works for focus URLs that are **full URLs** or **path-only**. Destination URLs can also be full or path-only.
+- Priority Score is designed for V1.5 and becomes the natural target list for embeddings-based recommendations later.
+"""
+        )
 
 
 
