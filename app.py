@@ -1,9 +1,14 @@
 # app.py
 # Streamlit Cloud–ready: Screaming Frog "All Inlinks" Analyzer (chunk-safe)
-# Focus Page Priority Report (focus pages are DESTINATION targets only)
-# Changes:
-# - Removed: "🧠 Optional: template CTA dominance filter (Top Anchor %)" (UI + logic + stats)
-# - Added: Source page path exclusion filter (e.g. exclude sources containing /page/)
+# Adds: Focus Page Priority Report (focus pages are DESTINATION targets only)
+#
+# Changes in this version:
+# 1) Re-added a dominance filter, but in a safer "module-amplification" form:
+#    - Exclude DESTINATIONS where Top Anchor % >= threshold
+#    - AND Unique_Source_Pages >= minimum unique sources
+#    This targets repeated “related/trending blocks” (title anchors) without nuking tiny samples.
+#
+# 2) Added an option to exclude rows by SOURCE page path (e.g. /page/) (row-level filter)
 
 import re
 import zipfile
@@ -61,6 +66,11 @@ class AppConfig:
     # NEW: Source page path exclusion (row-level)
     rx_source_path_excl: Optional[re.Pattern]
 
+    # Re-added: Destination-level dominance filter (safer)
+    enable_anchor_dominance_filter: bool
+    dominance_threshold: int
+    dominance_min_unique_sources: int
+
 
 @dataclass
 class Aggregates:
@@ -88,9 +98,11 @@ class FilterStats:
     removed_link_position: int
     removed_link_path: int
     removed_anchor: int
-
-    # NEW
     removed_source_path: int
+
+    # Destination-level dominance stats
+    destinations_before: int
+    destinations_removed_by_dominance: int
 
 
 # =========================
@@ -217,11 +229,7 @@ def focus_key(url: str) -> str:
 
 
 def destination_join_key(destination_url: str) -> str:
-    """
-    Join key for Destination URLs:
-    - If absolute: host+path
-    - If relative: path
-    """
+    """Join key for Destination URLs (absolute => host+path, relative => path)."""
     return focus_key(destination_url)
 
 
@@ -301,13 +309,13 @@ def apply_row_filters_with_stats(chunk: pd.DataFrame, cfg: AppConfig, stats: Fil
             lambda d: is_internal_destination(
                 d,
                 cfg.allowed_destination_domains,
-                cfg.keep_relative_destinations_as_internal
+                cfg.keep_relative_destinations_as_internal,
             )
         )
         chunk = chunk[mask]
         stats.removed_external_destination += (before - len(chunk))
 
-    # 4) NEW: exclude by Source PATH patterns (e.g. /page/)
+    # 4) exclude by Source PATH patterns (e.g. /page/)
     if cfg.rx_source_path_excl is not None:
         before = len(chunk)
         src_paths = chunk["Source"].map(source_path_only).astype("string").fillna("")
@@ -419,6 +427,23 @@ def compute_top_anchor_fields(destinations: List[str], agg: Aggregates) -> Tuple
     return top_anchor, top_anchor_pct
 
 
+def apply_destination_level_filters(out: pd.DataFrame, cfg: AppConfig, stats: FilterStats) -> pd.DataFrame:
+    stats.destinations_before = len(out)
+
+    if not cfg.enable_anchor_dominance_filter:
+        stats.destinations_removed_by_dominance = 0
+        return out
+
+    thr = float(cfg.dominance_threshold)
+    min_u = int(cfg.dominance_min_unique_sources)
+
+    # Exclude destinations where top anchor dominates AND there are enough unique sources
+    filtered = out[~((out["Top Anchor %"] >= thr) & (out["Unique_Source_Pages"] >= min_u))]
+
+    stats.destinations_removed_by_dominance = len(out) - len(filtered)
+    return filtered
+
+
 # =========================
 # Optional: stream-write filtered CSV
 # =========================
@@ -490,7 +515,7 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
     allowed_domains_text = st.text_input(
         "Allowed destination domain(s) (comma-separated)",
         value="",
-        help="Example: so.energy, blog.so.energy",
+        help="Example: example.com, blog.example.com",
     )
     keep_relative_destinations = st.checkbox(
         "Treat relative Destination URLs as internal",
@@ -518,10 +543,9 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
         status_keep = st.multiselect("Keep Status Code values (empty = keep all)", status_options, default=default_status)
         link_position_keep = st.multiselect("Keep Link Position values (empty = keep all)", linkpos_options, default=default_linkpos)
 
-    # NEW: Exclude by SOURCE page path patterns
+    # Source path exclusion (row-level)
     st.markdown("### 🚫 Exclude by Source page path (e.g. pagination)")
     enable_source_path_exclusions = st.checkbox("Enable Source path exclusions", value=True)
-
     default_source_path_excl = "\n".join(["/page/"])
     source_path_excl_text = st.text_area(
         "Source path patterns to exclude (one per line, 'contains' match)",
@@ -535,7 +559,12 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
     st.markdown("### Exclude by Link Path patterns (breadcrumbs/nav etc.)")
     exclude_by_link_path = st.checkbox("Enable Link Path exclusions", value=True)
     default_lp = "\n".join(["breadcrumb", "/ol/li", "aria-label=\"breadcrumb\"", "aria-label='breadcrumb'"])
-    lp_text = st.text_area("Link Path patterns to exclude (one per line)", value=default_lp, height=100, disabled=not exclude_by_link_path)
+    lp_text = st.text_area(
+        "Link Path patterns to exclude (one per line)",
+        value=default_lp,
+        height=100,
+        disabled=not exclude_by_link_path,
+    )
     rx_link_path_excl = compile_contains_patterns(lp_text) if exclude_by_link_path else None
 
     st.markdown("### 🚫 Exclude by Anchor text (template CTAs etc.)")
@@ -548,6 +577,33 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
         disabled=not enable_anchor_exclusions,
     )
     rx_anchor_excl = compile_contains_patterns(anchor_excl_text) if enable_anchor_exclusions else None
+
+    # Dominance filter (destination-level) – recommended for repeated “related/trending blocks”
+    st.markdown("### 🧠 Anchor dominance filter (module amplification)")
+    enable_anchor_dominance_filter = st.checkbox(
+        "Enable dominance filter (Destination-level)",
+        value=True,
+        help="Excludes destinations where the Top Anchor dominates AND the destination has enough unique source pages. "
+             "Useful for removing 'related/trending block' inflation where anchors are repeated titles.",
+    )
+    dominance_threshold = st.slider(
+        "Exclude destinations when Top Anchor % ≥",
+        0,
+        100,
+        90,
+        1,
+        disabled=not enable_anchor_dominance_filter,
+        help="Recommended 85–95 for related/trending blocks using repeated title anchors.",
+    )
+    dominance_min_unique_sources = st.number_input(
+        "…and Unique Source Pages ≥",
+        min_value=0,
+        max_value=1_000_000,
+        value=20,
+        step=5,
+        disabled=not enable_anchor_dominance_filter,
+        help="Prevents tiny samples (e.g. 3 links) from being excluded just because they share an anchor.",
+    )
 
     return AppConfig(
         chunksize=int(chunksize),
@@ -573,6 +629,10 @@ def build_config(sample_df: pd.DataFrame) -> AppConfig:
         rx_anchor_excl=rx_anchor_excl,
 
         rx_source_path_excl=rx_source_path_excl,
+
+        enable_anchor_dominance_filter=enable_anchor_dominance_filter,
+        dominance_threshold=int(dominance_threshold),
+        dominance_min_unique_sources=int(dominance_min_unique_sources),
     )
 
 
@@ -647,7 +707,6 @@ def build_focus_report(dest_summary: pd.DataFrame, focus_df: pd.DataFrame, url_c
         "Top Anchor %",
     ]
     out = merged[out_cols].copy()
-
     out = out.sort_values(["Priority Score", "Focus Metric"], ascending=False).reset_index(drop=True)
     return out
 
@@ -738,6 +797,8 @@ if run:
         removed_link_path=0,
         removed_anchor=0,
         removed_source_path=0,
+        destinations_before=0,
+        destinations_removed_by_dominance=0,
     )
 
     progress = st.progress(0, text="Reading file in chunks...")
@@ -780,6 +841,10 @@ if run:
         "Top Anchor %": top_anchor_pct,
     })
 
+    # Apply destination-level dominance filter (recommended)
+    out = apply_destination_level_filters(out, cfg, stats)
+
+    # Sort final
     out = out.sort_values(["Total_Inlinks", "Unique_Source_Pages"], ascending=False).reset_index(drop=True)
 
     # =========================
@@ -824,6 +889,11 @@ if run:
     ])
     st.dataframe(breakdown, use_container_width=True)
 
+    st.caption(
+        f"Destinations before dominance filter: {stats.destinations_before:,} • "
+        f"Removed by dominance filter: {stats.destinations_removed_by_dominance:,}"
+    )
+
     # =========================
     # Focus Page Priority Report
     # =========================
@@ -840,9 +910,10 @@ if run:
             st.warning(
                 "No focus pages matched the Destination URLs after filtering.\n\n"
                 "Common causes:\n"
-                "- Focus URLs are paths but Destination URLs are different paths (e.g. missing trailing segment)\n"
-                "- Focus list includes URLs filtered out (e.g. non-200, excluded by anchor/link path filters)\n"
-                "- Domain mismatch (if using external destination filtering)\n"
+                "- Focus URLs are paths but Destination URLs are different paths\n"
+                "- Focus list includes URLs filtered out\n"
+                "- Domain mismatch (if using destination domain filtering)\n"
+                "- Dominance filter removed focus destinations (try disabling it)\n"
             )
         else:
             st.caption("Priority Score = Deficit Score × Value Score (Value Score is normalized within focus set).")
@@ -897,9 +968,12 @@ if run:
     with st.expander("Notes"):
         st.markdown(
             """
-- **Focus pages are destination targets only**. The report shows which of those targets have the biggest internal linking deficit.
-- Matching works for focus URLs that are **full URLs** or **path-only**. Destination URLs can also be full or path-only.
-- Source path exclusion matches against **Source PATH only** (e.g. `/page/`), useful for excluding paginated listing pages from being counted as linking sources.
+- **Source path exclusion** matches against **Source PATH only** (e.g. `/page/`), useful for excluding paginated listing pages as linking sources.
+- **Dominance filter** removes DESTINATIONS from the destination summary when:
+  - **Top Anchor % ≥ threshold** (e.g. 90), and
+  - **Unique_Source_Pages ≥ minimum** (e.g. 20).
+  This is designed to reduce inflation from repeated “related/trending blocks” where the anchor is repeated (often the title).
+- Focus pages are destination targets only; if a focus page disappears, try lowering the threshold or disabling dominance.
 """
         )
 
