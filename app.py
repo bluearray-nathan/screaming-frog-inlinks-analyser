@@ -1,6 +1,7 @@
 import re
 import zipfile
 import tempfile
+import os
 from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
@@ -29,7 +30,6 @@ sample_rows = st.sidebar.number_input(
 )
 
 # Anchor counting can get memory-heavy on huge/dense sites.
-# This cap keeps memory bounded per destination while still finding top anchors in most cases.
 max_distinct_anchors_per_destination = st.sidebar.number_input(
     "Max distinct anchors tracked per destination",
     min_value=25,
@@ -37,10 +37,28 @@ max_distinct_anchors_per_destination = st.sidebar.number_input(
     value=200,
     step=25,
     help=(
-        "To keep memory stable, we cap how many distinct anchor texts we store per destination. "
-        "If a destination has more distinct anchors than this, extra anchors are counted in 'Other' "
-        "and may not be eligible to become the top anchor."
+        "Caps how many distinct anchor texts are stored per destination to keep memory stable."
     ),
+)
+
+st.sidebar.header("⬇️ Output files")
+write_filtered_csv = st.sidebar.checkbox(
+    "Create downloadable filtered CSV (can be large)",
+    value=False,
+    help=(
+        "Writes the filtered rows to a CSV while processing. "
+        "This can take longer and the resulting file may still be very large."
+    ),
+)
+
+# Optional: limit output size for Cloud safety
+max_filtered_rows = st.sidebar.number_input(
+    "Max filtered rows to write (0 = no limit)",
+    min_value=0,
+    max_value=50_000_000,
+    value=0,
+    step=100_000,
+    help="Set a cap to prevent generating a massive output file."
 )
 
 def normalize_url_for_compare(u: str) -> str:
@@ -68,11 +86,6 @@ def compile_contains_patterns(lines: str) -> re.Pattern | None:
     return re.compile("|".join(pats), flags=re.IGNORECASE)
 
 def materialize_to_path(uploaded) -> str:
-    """
-    Writes uploaded csv/gz/zip to a temp file.
-    If zip: extracts first CSV inside -> temp CSV path.
-    Otherwise writes raw bytes -> temp file (keeps extension).
-    """
     name = (uploaded.name or "").lower()
 
     if name.endswith(".zip"):
@@ -117,7 +130,6 @@ except Exception as e:
     st.error(f"Failed to read file: {e}")
     st.stop()
 
-# --- sample for real options ---
 sample_df = read_sample(path, int(sample_rows))
 
 required = {"Source", "Destination"}
@@ -139,7 +151,6 @@ status_options = uniq("Status Code")
 linkpos_options = uniq("Link Position")
 
 st.subheader("🎛️ Filters")
-
 preset = st.button("✨ Preset: Content + Follow + 200 + Hyperlink")
 
 c1, c2, c3 = st.columns(3)
@@ -150,8 +161,6 @@ with c2:
 with c3:
     st.caption("Tip: leave include-only filters empty to keep all values.")
 
-# Include-only filters (dynamic options from sample)
-# Empty selection means "keep all"
 default_type = ["Hyperlink"] if ("Hyperlink" in type_options) else []
 default_follow = ["Follow"] if ("Follow" in follow_options) else []
 default_status = ["200"] if ("200" in status_options) else (["200 OK"] if ("200 OK" in status_options) else [])
@@ -174,26 +183,25 @@ default_lp = "\n".join(["breadcrumb", "/ol/li", "aria-label=\"breadcrumb\"", "ar
 lp_text = st.text_area("Patterns to exclude (one per line)", value=default_lp, height=100, disabled=not exclude_by_link_path)
 rx_lp = compile_contains_patterns(lp_text) if exclude_by_link_path else None
 
-# Anchor column presence
-has_anchor_col = "Anchor" in sample_df.columns
-if not has_anchor_col:
-    st.warning("No 'Anchor' column found in the sample — Top Anchor columns will be blank unless the full file contains 'Anchor'.")
-
 run = st.button("🚀 Run analysis", type="primary")
 
 if run:
-    # Destination -> count of rows (after filters)
     total_inlinks: dict[str, int] = {}
-    # Destination -> set(Source)
     unique_sources: dict[str, set[str]] = {}
 
-    # Anchor aggregation:
-    # Destination -> total anchor occurrences (non-empty only)
     anchor_total: dict[str, int] = {}
-    # Destination -> dict(anchor_text -> count) (capped)
     anchor_counts: dict[str, dict[str, int]] = {}
-    # Destination -> count of anchor occurrences that were not stored due to cap
     anchor_other: dict[str, int] = {}
+
+    # Prepare filtered CSV output file (stream-write)
+    filtered_out_path = None
+    wrote_header = False
+    filtered_rows_written = 0
+
+    if write_filtered_csv:
+        tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        filtered_out_path = tmpf.name
+        tmpf.close()
 
     progress = st.progress(0, text="Reading file in chunks...")
 
@@ -220,21 +228,18 @@ if run:
         if "Source" not in chunk.columns or "Destination" not in chunk.columns:
             continue
 
-        # normalize required cols
         chunk["Source"] = chunk["Source"].astype("string").fillna("")
         chunk["Destination"] = chunk["Destination"].astype("string").fillna("")
 
-        # self-links
+        # filters
         if remove_self:
             src_norm = chunk["Source"].map(normalize_url_for_compare)
             dst_norm = chunk["Destination"].map(normalize_url_for_compare)
             chunk = chunk[src_norm != dst_norm]
 
-        # params
         if exclude_params:
             chunk = chunk[~chunk["Destination"].str.contains(r"\?", regex=True, na=False)]
 
-        # include-only filters (only apply if selection is non-empty and column exists)
         if type_keep and "Type" in chunk.columns:
             chunk = chunk[chunk["Type"].astype("string").fillna("").isin(type_keep)]
 
@@ -247,7 +252,6 @@ if run:
         if link_position_keep and "Link Position" in chunk.columns:
             chunk = chunk[chunk["Link Position"].astype("string").fillna("").isin(link_position_keep)]
 
-        # link path exclusions
         if rx_lp is not None and "Link Path" in chunk.columns:
             lps = chunk["Link Path"].astype("string").fillna("")
             chunk = chunk[~lps.str.contains(rx_lp, na=False)]
@@ -257,12 +261,25 @@ if run:
                 progress.progress(min(0.99, chunks_seen / (chunks_seen + 50)), text=f"Processed {rows_seen:,} rows...")
             continue
 
-        # anchor series (optional)
-        anchor_series = None
-        if "Anchor" in chunk.columns:
-            anchor_series = chunk["Anchor"].astype("string").fillna("")
+        # Stream-write filtered rows (optional)
+        if filtered_out_path is not None:
+            if max_filtered_rows == 0 or filtered_rows_written < int(max_filtered_rows):
+                remaining = None if max_filtered_rows == 0 else int(max_filtered_rows) - filtered_rows_written
+                chunk_to_write = chunk if remaining is None else chunk.head(max(0, remaining))
 
-        # aggregate
+                mode = "w" if not wrote_header else "a"
+                chunk_to_write.to_csv(
+                    filtered_out_path,
+                    mode=mode,
+                    header=not wrote_header,
+                    index=False,
+                )
+                wrote_header = True
+                filtered_rows_written += len(chunk_to_write)
+
+        # Anchor series
+        anchor_series = chunk["Anchor"].astype("string").fillna("") if "Anchor" in chunk.columns else None
+
         dests = chunk["Destination"].tolist()
         srcs = chunk["Source"].tolist()
         anchors = anchor_series.tolist() if anchor_series is not None else ["" for _ in dests]
@@ -271,13 +288,9 @@ if run:
             if not d:
                 continue
 
-            # Total rows
             total_inlinks[d] = total_inlinks.get(d, 0) + 1
-
-            # Unique sources
             unique_sources.setdefault(d, set()).add(s)
 
-            # Anchor stats (non-empty only)
             a = str(a).strip()
             if a:
                 anchor_total[d] = anchor_total.get(d, 0) + 1
@@ -287,18 +300,14 @@ if run:
                     dest_map = {}
                     anchor_counts[d] = dest_map
 
-                # if anchor already tracked, increment
                 if a in dest_map:
                     dest_map[a] += 1
                 else:
-                    # if we haven't hit cap, start tracking
                     if len(dest_map) < int(max_distinct_anchors_per_destination):
                         dest_map[a] = 1
                     else:
-                        # otherwise count it as "other"
                         anchor_other[d] = anchor_other.get(d, 0) + 1
 
-        # progress
         if chunks_seen % 5 == 0:
             progress.progress(min(0.99, chunks_seen / (chunks_seen + 50)), text=f"Processed {rows_seen:,} rows...")
 
@@ -307,20 +316,16 @@ if run:
     if not total_inlinks:
         st.warning(
             "No rows matched your filters.\n\n"
-            "Most likely cause: your include-only selections are too strict. "
             "Try clearing one or more include-only filters (set them to empty) and run again."
         )
         st.stop()
 
-    # Build output rows
     destinations = list(total_inlinks.keys())
-
     top_anchor = []
     top_anchor_pct = []
 
     for d in destinations:
         total_anchor_occ = anchor_total.get(d, 0)
-
         if total_anchor_occ == 0:
             top_anchor.append("")
             top_anchor_pct.append(0.0)
@@ -328,15 +333,11 @@ if run:
 
         amap = anchor_counts.get(d, {})
         if not amap:
-            # anchors existed but weren't tracked (unlikely unless cap=0, which we disallow)
             top_anchor.append("")
             top_anchor_pct.append(0.0)
             continue
 
-        # find top tracked anchor
         best_a, best_c = max(amap.items(), key=lambda kv: kv[1])
-
-        # % of all anchor occurrences (non-empty) for that destination
         pct = (best_c / total_anchor_occ) * 100.0
 
         top_anchor.append(best_a)
@@ -364,7 +365,6 @@ if run:
         mime="text/csv",
     )
 
-    # ✅ NEW: download all destinations
     st.download_button(
         "Download ALL destinations CSV",
         data=out.to_csv(index=False).encode("utf-8"),
@@ -372,22 +372,21 @@ if run:
         mime="text/csv",
     )
 
-    # Optional info about anchor cap
-    with st.expander("About Top Anchor %"):
-        st.markdown(
-            """
-- **Top Anchor** is the most common anchor text (by occurrences) for each Destination URL.
-- **Top Anchor %** is:
+    if filtered_out_path is not None:
+        # Read bytes for download (note: could be large; still usually OK for moderate outputs)
+        # If outputs are huge, you may want to warn users or cap max_filtered_rows.
+        with open(filtered_out_path, "rb") as f:
+            st.download_button(
+                "Download FILTERED links CSV (all columns, filtered rows)",
+                data=f.read(),
+                file_name="filtered_all_inlinks.csv",
+                mime="text/csv",
+            )
 
-  `top_anchor_occurrences ÷ total_anchor_occurrences_for_that_destination × 100`
+        if max_filtered_rows and filtered_rows_written >= int(max_filtered_rows):
+            st.info(f"Filtered CSV was capped at **{filtered_rows_written:,} rows** (per the max rows setting).")
 
-- Blank anchors are ignored for anchor calculations.
-- To keep memory stable, the app caps how many distinct anchors it tracks per destination
-  (you can change this in the sidebar). If a destination has extremely high anchor diversity,
-  the true top anchor *could* be outside the tracked set — but in practice, the top anchor is
-  usually among the most frequent and will be captured.
-"""
-        )
+    # Best-effort cleanup of temp filtered file on rerun: left as-is to avoid Streamlit rerun issues.
 
 
 
