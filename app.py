@@ -1,14 +1,12 @@
 # app.py
 # Streamlit Cloud–ready: Screaming Frog "All Inlinks" Analyzer (chunk-safe)
-# Adds: Focus Page Priority Report (focus pages are DESTINATION targets only)
-#
-# Changes in this version:
-# 1) Re-added a dominance filter, but in a safer "module-amplification" form:
-#    - Exclude DESTINATIONS where Top Anchor % >= threshold
-#    - AND Unique_Source_Pages >= minimum unique sources
-#    This targets repeated “related/trending blocks” (title anchors) without nuking tiny samples.
-#
-# 2) Added an option to exclude rows by SOURCE page path (e.g. /page/) (row-level filter)
+# + Focus Page Priority Report (focus pages are DESTINATION targets only)
+# + Internal Linking Recommendations (MVP):
+#     - Upload embeddings (URL + embeddings string)
+#     - Upload source metrics (URL + metric)
+#     - Recommend "link from X -> link to Y" for priority targets
+#     - Enforce similarity threshold, optional same folder, cap recs per source
+#     - Avoid recommending links that already exist (from All Inlinks)
 
 import re
 import zipfile
@@ -17,6 +15,7 @@ from dataclasses import dataclass
 from typing import Dict, Set, Optional, Tuple, List
 from urllib.parse import urlsplit, urlunsplit
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -63,10 +62,10 @@ class AppConfig:
     rx_link_path_excl: Optional[re.Pattern]
     rx_anchor_excl: Optional[re.Pattern]
 
-    # NEW: Source page path exclusion (row-level)
+    # Exclude rows by SOURCE path (row-level)
     rx_source_path_excl: Optional[re.Pattern]
 
-    # Re-added: Destination-level dominance filter (safer)
+    # Destination-level dominance filter (module amplification)
     enable_anchor_dominance_filter: bool
     dominance_threshold: int
     dominance_min_unique_sources: int
@@ -74,11 +73,15 @@ class AppConfig:
 
 @dataclass
 class Aggregates:
-    total_inlinks: Dict[str, int]
-    unique_sources: Dict[str, Set[str]]
+    total_inlinks: Dict[str, int]                      # Destination raw string -> count
+    unique_sources: Dict[str, Set[str]]                # Destination raw -> set(Source raw)
 
-    anchor_total: Dict[str, int]                 # dest -> total non-empty anchor occurrences
-    anchor_counts: Dict[str, Dict[str, int]]     # dest -> {anchor_text -> count} (capped)
+    anchor_total: Dict[str, int]                       # Destination raw -> total non-empty anchor occurrences
+    anchor_counts: Dict[str, Dict[str, int]]           # Destination raw -> {anchor_text -> count} (capped)
+
+    # For recommendation engine: canonical keys + existing links
+    existing_link_pairs: Set[Tuple[str, str]]          # (source_key, dest_key)
+    key_to_url: Dict[str, str]                         # canonical key -> best-seen absolute/relative URL
 
     filtered_out_path: Optional[str]
     filtered_rows_written: int
@@ -183,11 +186,7 @@ def is_internal_destination(dest: str, allowed_domains: Set[str], keep_relative:
 
 
 def source_path_only(src: str) -> str:
-    """
-    Returns just the path portion of the Source.
-    - If absolute URL: returns parts.path
-    - If relative/path-only: returns the string path as-is (via urlsplit)
-    """
+    """Return path portion of Source."""
     if src is None or pd.isna(src):
         return ""
     s = str(src).strip()
@@ -197,11 +196,17 @@ def source_path_only(src: str) -> str:
     return parts.path or ""
 
 
-def focus_key(url: str) -> str:
+def canonical_url_key(url: str) -> str:
     """
-    Create a join key that matches focus URLs to Destination URLs robustly.
-    - If url is absolute: host+path (no query/fragment), lowercased host, trimmed trailing slash in path.
-    - If url is relative/path-only: path only (leading slash enforced), trimmed trailing slash.
+    Canonical key for matching across:
+    - All Inlinks Source/Destination
+    - Embeddings URLs
+    - Metrics URLs
+    - Focus URLs
+
+    Rules:
+    - Absolute URL => host(lower, no www) + normalized path (trim trailing slash) ; ignore query/fragment
+    - Relative/path-only => normalized path (leading /, trim trailing slash) ; ignore query/fragment
     """
     if url is None or pd.isna(url):
         return ""
@@ -211,10 +216,15 @@ def focus_key(url: str) -> str:
 
     parts = urlsplit(s)
 
-    # Relative (no scheme/netloc): treat as path
+    # Relative/path-only
     if parts.scheme == "" and parts.netloc == "":
         p = parts.path if parts.path else s
         p = p.strip()
+        # strip any query/fragment if user pasted them in a "relative" string
+        if "?" in p:
+            p = p.split("?", 1)[0]
+        if "#" in p:
+            p = p.split("#", 1)[0]
         if not p.startswith("/"):
             p = "/" + p
         if p != "/" and p.endswith("/"):
@@ -228,9 +238,47 @@ def focus_key(url: str) -> str:
     return f"{host}{path}"
 
 
+def url_path_for_folder(url: str) -> str:
+    """Get a normalized path from URL (absolute or relative)."""
+    if url is None or pd.isna(url):
+        return ""
+    s = str(url).strip()
+    if not s:
+        return ""
+    parts = urlsplit(s)
+    p = parts.path or ""
+    if not p.startswith("/"):
+        p = "/" + p
+    if p != "/" and p.endswith("/"):
+        p = p.rstrip("/")
+    return p
+
+
+def folder_key(url: str, depth: int = 1) -> str:
+    """
+    Folder key based on first N path segments.
+    depth=1 => '/blog'
+    depth=2 => '/blog/category'
+    """
+    p = url_path_for_folder(url)
+    if not p or p == "/":
+        return "/"
+    segs = [seg for seg in p.split("/") if seg]
+    if not segs:
+        return "/"
+    depth = max(1, int(depth))
+    take = segs[:depth]
+    return "/" + "/".join(take)
+
+
+def focus_key(url: str) -> str:
+    """Backward-compatible alias (used by focus report)."""
+    return canonical_url_key(url)
+
+
 def destination_join_key(destination_url: str) -> str:
-    """Join key for Destination URLs (absolute => host+path, relative => path)."""
-    return focus_key(destination_url)
+    """Backward-compatible alias (used by focus report)."""
+    return canonical_url_key(destination_url)
 
 
 # =========================
@@ -376,9 +424,23 @@ def update_aggregates_from_chunk(chunk: pd.DataFrame, cfg: AppConfig, agg: Aggre
             continue
         s = srcs[i] if i < len(srcs) else ""
 
+        # Destination summary aggregation (raw URLs)
         agg.total_inlinks[d] = agg.total_inlinks.get(d, 0) + 1
         agg.unique_sources.setdefault(d, set()).add(s)
 
+        # For recommender: store canonical key link pair
+        sk = canonical_url_key(s)
+        dk = canonical_url_key(d)
+        if sk and dk:
+            agg.existing_link_pairs.add((sk, dk))
+
+        # key_to_url mapping (best effort)
+        if sk and sk not in agg.key_to_url and s:
+            agg.key_to_url[sk] = s
+        if dk and dk not in agg.key_to_url and d:
+            agg.key_to_url[dk] = d
+
+        # Anchor distribution per destination (raw destination string)
         if anchors is None:
             continue
 
@@ -437,9 +499,7 @@ def apply_destination_level_filters(out: pd.DataFrame, cfg: AppConfig, stats: Fi
     thr = float(cfg.dominance_threshold)
     min_u = int(cfg.dominance_min_unique_sources)
 
-    # Exclude destinations where top anchor dominates AND there are enough unique sources
     filtered = out[~((out["Top Anchor %"] >= thr) & (out["Unique_Source_Pages"] >= min_u))]
-
     stats.destinations_removed_by_dominance = len(out) - len(filtered)
     return filtered
 
@@ -712,6 +772,250 @@ def build_focus_report(dest_summary: pd.DataFrame, focus_df: pd.DataFrame, url_c
 
 
 # =========================
+# Embeddings + Metrics (MVP recommender)
+# =========================
+def load_csv_with_fallback(uploaded) -> Optional[pd.DataFrame]:
+    if uploaded is None:
+        return None
+    kwargs = dict(low_memory=False, dtype="string")
+    try:
+        df = pd.read_csv(uploaded, **kwargs)
+    except UnicodeDecodeError:
+        uploaded.seek(0)
+        df = pd.read_csv(uploaded, encoding="cp1252", **kwargs)
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def parse_embeddings_df(df: pd.DataFrame, url_col: str, emb_col: str) -> Tuple[pd.DataFrame, int, int]:
+    """
+    Returns (emb_df, dim, bad_rows)
+    emb_df columns: ['__url', '__key', '__emb'] where __emb is np.ndarray float32.
+    """
+    tmp = df[[url_col, emb_col]].copy()
+    tmp["__url"] = tmp[url_col].astype("string").fillna("").str.strip()
+    tmp["__key"] = tmp["__url"].map(canonical_url_key)
+
+    bad = 0
+    vecs = []
+    keys = []
+    urls = []
+
+    dim = None
+    for u, k, emb in zip(tmp["__url"].tolist(), tmp["__key"].tolist(), tmp[emb_col].astype("string").fillna("").tolist()):
+        if not u or not k:
+            bad += 1
+            continue
+        s = str(emb).strip()
+        if not s:
+            bad += 1
+            continue
+        try:
+            arr = np.fromstring(s, sep=",", dtype=np.float32)
+        except Exception:
+            bad += 1
+            continue
+        if arr.size == 0:
+            bad += 1
+            continue
+        if dim is None:
+            dim = int(arr.size)
+        elif int(arr.size) != int(dim):
+            bad += 1
+            continue
+        vecs.append(arr)
+        keys.append(k)
+        urls.append(u)
+
+    if dim is None or len(vecs) == 0:
+        return pd.DataFrame(columns=["__url", "__key", "__emb"]), 0, bad
+
+    out = pd.DataFrame({"__url": urls, "__key": keys})
+    out["__emb"] = vecs
+    # drop duplicates by key (keep first)
+    out = out.drop_duplicates(subset="__key", keep="first").reset_index(drop=True)
+    return out, dim, bad
+
+
+@st.cache_resource(show_spinner=False)
+def build_normalized_matrix(keys: Tuple[str, ...], vecs: Tuple[np.ndarray, ...]) -> np.ndarray:
+    """
+    Build an L2-normalized matrix (N x D) float32.
+    Cached by (keys, vecs) identity; caller should pass stable tuples.
+    """
+    X = np.vstack(vecs).astype(np.float32)
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    X = X / norms
+    return X
+
+
+def topk_cosine_sim(X_norm: np.ndarray, idx: int, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns (indices, sims) for top-k most similar to row idx (excluding itself).
+    """
+    v = X_norm[idx]
+    sims = X_norm @ v  # cosine similarity because normalized
+    sims[idx] = -1.0   # exclude self
+    if k >= len(sims):
+        order = np.argsort(-sims)
+    else:
+        part = np.argpartition(-sims, kth=k)[:k]
+        order = part[np.argsort(-sims[part])]
+    return order, sims[order]
+
+
+def normalize_metric(series: pd.Series) -> pd.Series:
+    """
+    Normalize a metric to 0..1 with log1p scaling + max division (robust-ish).
+    """
+    s = pd.to_numeric(series, errors="coerce").fillna(0.0).astype(float)
+    s = np.log1p(s)
+    mx = float(s.max()) if len(s) else 0.0
+    if mx <= 0:
+        return pd.Series([0.0] * len(s), index=s.index)
+    return s / mx
+
+
+def best_url_for_key(key: str, fallback: str, agg: Aggregates) -> str:
+    """
+    Prefer URL captured from inlinks processing, else fallback (embeddings/metrics).
+    """
+    if key in agg.key_to_url and agg.key_to_url[key]:
+        return agg.key_to_url[key]
+    return fallback
+
+
+def build_recommendations(
+    focus_report: pd.DataFrame,
+    agg: Aggregates,
+    emb_df: pd.DataFrame,
+    metrics_df: pd.DataFrame,
+    metrics_url_col: str,
+    metrics_value_col: str,
+    similarity_threshold: float,
+    per_target_k: int,
+    max_recs_per_target: int,
+    max_recs_per_source: int,
+    enforce_same_folder: bool,
+    folder_depth: int,
+) -> pd.DataFrame:
+    """
+    Returns a dataframe of recommendations: Source -> Target, scored & capped.
+    Requires focus_report with Destination + Priority Score.
+    """
+
+    # --- metrics map ---
+    m = metrics_df[[metrics_url_col, metrics_value_col]].copy()
+    m["__url"] = m[metrics_url_col].astype("string").fillna("").str.strip()
+    m["__key"] = m["__url"].map(canonical_url_key)
+    m["__metric_raw"] = m[metrics_value_col].astype("string").fillna("")
+    m["__metric"] = pd.to_numeric(m["__metric_raw"].str.replace(",", "", regex=False).str.strip(), errors="coerce").fillna(0.0)
+    # keep best (max metric) per key
+    m = m.sort_values("__metric", ascending=False).drop_duplicates(subset="__key", keep="first")
+    m["__metric_norm"] = normalize_metric(m["__metric"])
+    metric_map = dict(zip(m["__key"], m["__metric"]))
+    metric_norm_map = dict(zip(m["__key"], m["__metric_norm"]))
+    metric_url_map = dict(zip(m["__key"], m["__url"]))
+
+    # --- embeddings index ---
+    keys = emb_df["__key"].tolist()
+    urls = emb_df["__url"].tolist()
+    vecs = emb_df["__emb"].tolist()
+
+    key_to_idx = {k: i for i, k in enumerate(keys)}
+    idx_to_key = {i: k for i, k in enumerate(keys)}
+    idx_to_url = {i: u for i, u in enumerate(urls)}
+
+    X_norm = build_normalized_matrix(tuple(keys), tuple(vecs))
+
+    # --- focus targets list ---
+    fr = focus_report.copy()
+    fr["__target_url"] = fr["Destination"].astype("string").fillna("").str.strip()
+    fr["__target_key"] = fr["__target_url"].map(canonical_url_key)
+    fr["__priority"] = fr["Priority Score"].astype(float)
+
+    # keep only targets with embeddings
+    fr = fr[fr["__target_key"].isin(key_to_idx)].copy()
+    if fr.empty:
+        return pd.DataFrame()
+
+    # deterministic order: priority desc
+    fr = fr.sort_values("__priority", ascending=False).reset_index(drop=True)
+
+    rec_rows = []
+    used_per_source = {}  # source_key -> count
+
+    # We’ll build and later cap per-target, but also enforce per-source online.
+    for _, row in fr.iterrows():
+        t_url = row["__target_url"]
+        t_key = row["__target_key"]
+        t_priority = float(row["__priority"])
+
+        t_idx = key_to_idx.get(t_key)
+        if t_idx is None:
+            continue
+
+        t_folder = folder_key(t_url, depth=folder_depth)
+
+        cand_idx, cand_sims = topk_cosine_sim(X_norm, t_idx, k=max(per_target_k, max_recs_per_target * 3))
+
+        per_target_added = 0
+        for si, sim in zip(cand_idx.tolist(), cand_sims.tolist()):
+            if sim < float(similarity_threshold):
+                break  # because sorted desc
+            s_key = idx_to_key[si]
+            s_url_raw = idx_to_url[si]
+
+            # optional same folder
+            if enforce_same_folder:
+                s_folder = folder_key(s_url_raw, depth=folder_depth)
+                if s_folder != t_folder:
+                    continue
+            else:
+                s_folder = folder_key(s_url_raw, depth=folder_depth)
+
+            # avoid recommending if already linked
+            if (s_key, t_key) in agg.existing_link_pairs:
+                continue
+
+            # cap per source
+            c = used_per_source.get(s_key, 0)
+            if c >= int(max_recs_per_source):
+                continue
+
+            # metric for source (optional but recommended; if missing, treat as 0)
+            s_metric = float(metric_map.get(s_key, 0.0))
+            s_metric_norm = float(metric_norm_map.get(s_key, 0.0))
+
+            score = (t_priority * s_metric_norm * float(sim))
+
+            rec_rows.append({
+                "Source URL": best_url_for_key(s_key, metric_url_map.get(s_key, s_url_raw), agg),
+                "Target URL": best_url_for_key(t_key, t_url, agg),
+                "Similarity": round(float(sim), 4),
+                "Source Metric": s_metric,
+                "Source Metric Score": round(s_metric_norm, 4),
+                "Target Priority Score": round(t_priority, 6),
+                "Recommendation Score": round(score, 6),
+                "Source Folder": s_folder,
+                "Target Folder": t_folder,
+            })
+
+            used_per_source[s_key] = c + 1
+            per_target_added += 1
+            if per_target_added >= int(max_recs_per_target):
+                break
+
+    if not rec_rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rec_rows)
+    out = out.sort_values(["Recommendation Score", "Similarity"], ascending=False).reset_index(drop=True)
+    return out
+
+
+# =========================
 # Main flow
 # =========================
 if uploaded_file is None:
@@ -759,11 +1063,50 @@ if focus_df is not None and not focus_df.empty:
         focus_metric_col = st.selectbox("Select Metric column (numeric)", options=cols, index=metric_default_index)
 
     st.caption(
-        "Matching works if your focus URLs are full URLs (https://...) OR path-only (/solar/...). "
+        "Matching works if your focus URLs are full URLs (https://...) OR path-only (/blog/... ). "
         "Metric can be sessions, revenue, conversions, or a manual priority score."
     )
 else:
     st.info("No focus CSV uploaded — you’ll still get Top Destinations + downloads.")
+
+st.divider()
+st.subheader("🧩 Internal Linking Recommendations (MVP) — optional uploads")
+emb_upload = st.file_uploader("Upload Embeddings CSV (URL + embeddings)", type=["csv"], key="emb_csv")
+met_upload = st.file_uploader("Upload Source Metrics CSV (URL + metric)", type=["csv"], key="met_csv")
+
+emb_df_raw = load_csv_with_fallback(emb_upload)
+met_df_raw = load_csv_with_fallback(met_upload)
+
+emb_url_col = emb_emb_col = None
+met_url_col = met_val_col = None
+
+if emb_df_raw is not None and not emb_df_raw.empty:
+    st.success(f"Embeddings CSV loaded: {emb_df_raw.shape[0]:,} rows × {emb_df_raw.shape[1]:,} cols")
+    with st.expander("Preview embeddings CSV"):
+        st.dataframe(emb_df_raw.head(20), use_container_width=True)
+
+    ecols = list(emb_df_raw.columns)
+    c1, c2 = st.columns(2)
+    with c1:
+        emb_url_col = st.selectbox("Embeddings: URL column", options=ecols, index=0, key="emb_url_col")
+    with c2:
+        emb_emb_col = st.selectbox("Embeddings: Embedding column", options=ecols, index=1 if len(ecols) > 1 else 0, key="emb_emb_col")
+else:
+    st.info("No embeddings CSV uploaded (recommendations will be unavailable).")
+
+if met_df_raw is not None and not met_df_raw.empty:
+    st.success(f"Source metrics CSV loaded: {met_df_raw.shape[0]:,} rows × {met_df_raw.shape[1]:,} cols")
+    with st.expander("Preview source metrics CSV"):
+        st.dataframe(met_df_raw.head(20), use_container_width=True)
+
+    mcols = list(met_df_raw.columns)
+    c1, c2 = st.columns(2)
+    with c1:
+        met_url_col = st.selectbox("Metrics: URL column", options=mcols, index=0, key="met_url_col")
+    with c2:
+        met_val_col = st.selectbox("Metrics: Metric column (numeric)", options=mcols, index=1 if len(mcols) > 1 else 0, key="met_val_col")
+else:
+    st.info("No source metrics CSV uploaded (recommendations will still run, but sources without metrics score as 0).")
 
 run = st.button("🚀 Run analysis", type="primary")
 
@@ -780,6 +1123,8 @@ if run:
         unique_sources={},
         anchor_total={},
         anchor_counts={},
+        existing_link_pairs=set(),
+        key_to_url={},
         filtered_out_path=filtered_out_path,
         filtered_rows_written=0,
     )
@@ -841,7 +1186,7 @@ if run:
         "Top Anchor %": top_anchor_pct,
     })
 
-    # Apply destination-level dominance filter (recommended)
+    # Apply dominance filter
     out = apply_destination_level_filters(out, cfg, stats)
 
     # Sort final
@@ -897,6 +1242,7 @@ if run:
     # =========================
     # Focus Page Priority Report
     # =========================
+    focus_report = None
     if focus_df is not None and focus_url_col and focus_metric_col:
         st.subheader("🎯 Focus Page Priority Report")
 
@@ -936,6 +1282,106 @@ if run:
     st.dataframe(out_top, use_container_width=True)
 
     # =========================
+    # Internal Linking Recommendations (MVP)
+    # =========================
+    st.subheader("🧩 Internal Linking Recommendations (MVP)")
+
+    if focus_report is None or focus_report is False or not isinstance(focus_report, pd.DataFrame) or focus_report.empty:
+        st.info("Upload a Focus Pages CSV and run analysis to generate a priority set. Recommendations are based on that priority set.")
+    elif emb_df_raw is None or emb_url_col is None or emb_emb_col is None:
+        st.info("Upload an embeddings CSV (URL + embeddings) to enable recommendations.")
+    else:
+        # Parse embeddings
+        emb_parsed, dim, bad_rows = parse_embeddings_df(emb_df_raw, emb_url_col, emb_emb_col)
+        if emb_parsed.empty or dim == 0:
+            st.error("Embeddings parsing produced no usable vectors. Check your selected columns.")
+        else:
+            st.caption(f"Parsed embeddings: {len(emb_parsed):,} URLs • dim={dim:,} • skipped rows={bad_rows:,}")
+
+            # Config UI
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                similarity_threshold = st.slider("Similarity threshold", 0.0, 1.0, 0.78, 0.01)
+            with c2:
+                top_focus_n = st.number_input("Top focus targets to process", min_value=10, max_value=5000, value=100, step=10)
+            with c3:
+                per_target_k = st.number_input("Candidate sources to consider per target (K)", min_value=10, max_value=5000, value=200, step=10)
+            with c4:
+                max_recs_per_target = st.number_input("Max recommendations per target", min_value=1, max_value=200, value=20, step=1)
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                max_recs_per_source = st.number_input("Cap recommendations per source", min_value=1, max_value=200, value=5, step=1)
+            with c2:
+                enforce_same_folder = st.checkbox("Only recommend within same folder", value=True)
+            with c3:
+                folder_depth = st.selectbox("Folder depth", options=[1, 2, 3], index=0, disabled=not enforce_same_folder)
+
+            use_metrics = (met_df_raw is not None and met_url_col is not None and met_val_col is not None)
+            if not use_metrics:
+                st.warning("No source metrics selected. Sources without metrics will score 0 (Recommendation Score will be 0).")
+
+            # Compute recommendations
+            fr_top = focus_report.head(int(top_focus_n)).copy()
+
+            try:
+                recs = build_recommendations(
+                    focus_report=fr_top,
+                    agg=agg,
+                    emb_df=emb_parsed,
+                    metrics_df=(met_df_raw if use_metrics else pd.DataFrame({met_url_col or "url": [], met_val_col or "metric": []})),
+                    metrics_url_col=(met_url_col or "url"),
+                    metrics_value_col=(met_val_col or "metric"),
+                    similarity_threshold=float(similarity_threshold),
+                    per_target_k=int(per_target_k),
+                    max_recs_per_target=int(max_recs_per_target),
+                    max_recs_per_source=int(max_recs_per_source),
+                    enforce_same_folder=bool(enforce_same_folder),
+                    folder_depth=int(folder_depth),
+                )
+            except Exception as e:
+                st.error(f"Failed to build recommendations: {e}")
+                recs = pd.DataFrame()
+
+            if recs.empty:
+                st.warning(
+                    "No recommendations produced. Common causes:\n"
+                    "- Similarity threshold too high\n"
+                    "- Focus targets missing embeddings\n"
+                    "- Most candidates already link to targets (dedup)\n"
+                    "- Folder constraint too strict\n"
+                    "- Metrics missing (scores may all be 0; still should show rows though)\n"
+                )
+            else:
+                st.caption("Recommendations are 'link from Source URL → link to Target URL'. No anchor text is proposed in this MVP.")
+                rows_show = st.number_input("Recommendation rows to show", min_value=10, max_value=5000, value=200, step=10)
+                st.dataframe(recs.head(int(rows_show)), use_container_width=True)
+
+                st.download_button(
+                    "Download recommendations CSV",
+                    data=recs.to_csv(index=False).encode("utf-8"),
+                    file_name="internal_link_recommendations.csv",
+                    mime="text/csv",
+                )
+
+                # Source-centric view (helpful for implementation)
+                st.markdown("#### Source-centric view (group by Source URL)")
+                src_view = (
+                    recs.sort_values(["Source URL", "Recommendation Score"], ascending=[True, False])
+                    .groupby("Source URL", as_index=False)
+                    .head(int(max_recs_per_source))
+                    .reset_index(drop=True)
+                )
+                st.dataframe(src_view.head(int(rows_show)), use_container_width=True)
+
+                st.download_button(
+                    "Download source-centric recommendations CSV",
+                    data=src_view.to_csv(index=False).encode("utf-8"),
+                    file_name="internal_link_recommendations_by_source.csv",
+                    mime="text/csv",
+                )
+
+    # =========================
     # Downloads
     # =========================
     st.subheader("⬇️ Downloads")
@@ -968,12 +1414,16 @@ if run:
     with st.expander("Notes"):
         st.markdown(
             """
-- **Source path exclusion** matches against **Source PATH only** (e.g. `/page/`), useful for excluding paginated listing pages as linking sources.
 - **Dominance filter** removes DESTINATIONS from the destination summary when:
-  - **Top Anchor % ≥ threshold** (e.g. 90), and
-  - **Unique_Source_Pages ≥ minimum** (e.g. 20).
-  This is designed to reduce inflation from repeated “related/trending blocks” where the anchor is repeated (often the title).
-- Focus pages are destination targets only; if a focus page disappears, try lowering the threshold or disabling dominance.
+  - **Top Anchor % ≥ threshold**, and
+  - **Unique_Source_Pages ≥ minimum**.
+  This reduces inflation from repeated “related/trending blocks” where anchors are repeated (often titles).
+
+- **Recommendations (MVP)**:
+  - Require **Focus Page Priority Report** + **Embeddings CSV**.
+  - Optional **Source metrics CSV** boosts valuable source pages.
+  - Enforces **similarity threshold**, optional **same folder**, caps **recs per source**, and avoids **already-existing links**.
+  - Outputs only: **link from page X → link to page Y** (no anchor text yet).
 """
         )
 
